@@ -450,6 +450,61 @@ def is_valid_alias(alias: str) -> bool:
 
 `encode_base62` converts an integer to a Base62 string by repeatedly dividing by 62 and mapping remainders to `[a-zA-Z0-9]`. For example, ID `12345` becomes `"dnh"`. `generate_short_code` takes the database-assigned auto-increment ID, encodes it, and pads with random characters so the code is always exactly `length` characters. The random padding prevents users from guessing the next short code by incrementing. `generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL. `is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long. **For Production use Snowflake Id with Base62 encoding without truncation or random padding.**
 
+### Production: Snowflake ID + Base62
+
+```python
+import time, threading, string
+
+BASE62 = string.ascii_letters + string.digits
+EPOCH = 1_704_067_200_000  # 2024-01-01 UTC in ms
+
+
+class Snowflake:
+    """
+    64-bit ID: 41-bit timestamp | 10-bit machine | 12-bit sequence
+    → 4096 IDs/ms/machine, no collisions, no DB coordination.
+    """
+
+    def __init__(self, machine_id: int = 0):
+        assert 0 <= machine_id < 1024
+        self.machine_id = machine_id
+        self._seq = 0
+        self._last_ts = -1
+        self._lock = threading.Lock()
+
+    def next_id(self) -> int:
+        with self._lock:
+            ts = int(time.time() * 1000) - EPOCH
+            if ts == self._last_ts:
+                self._seq = (self._seq + 1) & 0xFFF
+                if self._seq == 0:          # 4096 exhausted, wait 1 ms
+                    while ts <= self._last_ts:
+                        ts = int(time.time() * 1000) - EPOCH
+            else:
+                self._seq = 0
+            self._last_ts = ts
+            return (ts << 22) | (self.machine_id << 12) | self._seq
+
+
+def to_base62(num: int) -> str:
+    if num == 0:
+        return BASE62[0]
+    chars = []
+    while num:
+        chars.append(BASE62[num % 62])
+        num //= 62
+    return "".join(reversed(chars))
+
+
+# Usage
+_sf = Snowflake(machine_id=0)
+
+def generate_short_code() -> str:
+    return to_base62(_sf.next_id())    # ~11 chars, unique, non-guessable
+```
+
+Each call to `next_id()` assembles a 64-bit int from a millisecond timestamp (41 bits), a machine identifier (10 bits, supporting 1,024 workers), and a sequence counter (12 bits, 4,096 IDs per millisecond). Base62-encoding this directly produces an **~11-character** code that is unique, time-sortable, and non-sequential — no retries or DB lookups needed.
+
 ---
 
 ## Core API – Shorten & Redirect
@@ -931,6 +986,79 @@ if __name__ == "__main__":
 ```
 
 This script is designed to run as a **cron job** or Cloud Scheduler task (e.g., every hour). It queries for active URLs past their expiration, marks them inactive, and evicts them from Redis. Running cleanup as a separate process avoids adding latency to the redirect path. In production, you could schedule this with `Cloud Scheduler → Cloud Run Job` or a Kubernetes CronJob.
+
+### GCP Deployment: Cloud Scheduler → Cloud Run Job
+
+**Step 1 — Containerize the cleanup script**
+
+Use the same `Dockerfile` but override the entrypoint for the job:
+
+```dockerfile
+# Dockerfile.cleanup
+FROM python:3.14-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.14-slim
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY . .
+
+CMD ["python", "-m", "app.cleanup"]
+```
+
+**Step 2 — Push the image to Artifact Registry**
+
+```bash
+# Create a repository (one-time)
+gcloud artifacts repositories create url-shortener \
+  --repository-format=docker \
+  --location=us-central1
+
+# Build and push
+gcloud builds submit \
+  --tag us-central1-docker.pkg.dev/PROJECT_ID/url-shortener/cleanup:latest \
+  -f Dockerfile.cleanup .
+```
+
+**Step 3 — Create a Cloud Run Job**
+
+```bash
+gcloud run jobs create url-cleanup \
+  --image us-central1-docker.pkg.dev/PROJECT_ID/url-shortener/cleanup:latest \
+  --region us-central1 \
+  --set-env-vars DATABASE_URL=postgresql://user:pass@DB_IP:5432/urlshortener,REDIS_URL=redis://REDIS_IP:6379/0 \
+  --vpc-connector my-connector \
+  --max-retries 2 \
+  --task-timeout 300s
+```
+
+`--vpc-connector` lets the job reach Cloud SQL and Memorystore (Redis) over private IPs. `--max-retries 2` retries on failure. `--task-timeout 300s` kills it if cleanup hangs beyond 5 minutes.
+
+**Step 4 — Schedule it with Cloud Scheduler**
+
+```bash
+# Create a service account for the scheduler
+gcloud iam service-accounts create cleanup-scheduler
+
+# Grant it permission to invoke the Cloud Run job
+gcloud run jobs add-iam-policy-binding url-cleanup \
+  --region us-central1 \
+  --member serviceAccount:cleanup-scheduler@PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/run.invoker
+
+# Create the hourly schedule
+gcloud scheduler jobs create http url-cleanup-schedule \
+  --location us-central1 \
+  --schedule "0 * * * *" \
+  --time-zone "UTC" \
+  --uri "https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/PROJECT_ID/jobs/url-cleanup:run" \
+  --http-method POST \
+  --oauth-service-account-email cleanup-scheduler@PROJECT_ID.iam.gserviceaccount.com
+```
+
+`--schedule "0 * * * *"` triggers every hour at minute 0. Cloud Scheduler makes an authenticated HTTP POST to the Cloud Run Jobs API, which spins up a container, runs the cleanup, and shuts down — you pay only for execution time.
 
 ---
 

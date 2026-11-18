@@ -4,28 +4,29 @@
 
 ## Table of Contents
 
-1. [Requirements & Estimations](#requirements--estimations)
-2. [High-Level Architecture](#high-level-architecture)
-3. [Project Setup](#project-setup)
-4. [Database Design](#database-design)
-5. [URL Shortening Algorithm](#url-shortening-algorithm)
-6. [Core API – Shorten & Redirect](#core-api--shorten--redirect)
-7. [Caching with Redis](#caching-with-redis)
-8. [Rate Limiting](#rate-limiting)
-9. [Analytics & Click Tracking](#analytics--click-tracking)
-10. [Custom Aliases & Expiration](#custom-aliases--expiration)
-11. [Docker & Docker Compose](#docker--docker-compose)
-12. [Testing](#testing)
-13. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
-14. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
+1. [Step 1 — Health Check FastAPI in Docker Compose](#step-1--health-check-fastapi-in-docker-compose)
+2. [Step 2 — Connect to PostgreSQL](#step-2--connect-to-postgresql)
+3. [Step 3 — URL Model + POST API + Tests](#step-3--url-model--post-api--tests)
+4. [Step 4 — Redirect Endpoint + Tests](#step-4--redirect-endpoint--tests)
+5. [Step 5 — Better Algorithms, Custom Aliases & Expiration](#step-5--better-algorithms-custom-aliases--expiration)
+6. [Step 6 — Caching with Redis](#step-6--caching-with-redis)
+7. [Step 7 — Rate Limiting](#step-7--rate-limiting)
+8. [Step 8 — Click Events Model + Analytics](#step-8--click-events-model--analytics)
+9. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
+10. [Testing (Final)](#testing-final)
+11. [Project Setup (Final)](#project-setup-final)
+12. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
+13. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
 
 ---
 
-## Requirements & Estimations
+## Step 1 — Health Check FastAPI in Docker Compose
+
+### Requirements & Estimations
 
 Before writing a single line of code, define what the system needs to do and estimate the scale it must handle.
 
-### Functional Requirements
+#### Functional Requirements
 
 | Requirement  | Description                                                      |
 | ------------ | ---------------------------------------------------------------- |
@@ -35,7 +36,7 @@ Before writing a single line of code, define what the system needs to do and est
 | Expiration   | URLs can have a TTL after which they stop working                |
 | Analytics    | Track click count, timestamp, referrer, and geolocation per link |
 
-### Non-Functional Requirements
+#### Non-Functional Requirements
 
 | Requirement  | Target                                                 |
 | ------------ | ------------------------------------------------------ |
@@ -44,7 +45,7 @@ Before writing a single line of code, define what the system needs to do and est
 | Durability   | No shortened link should ever be lost                  |
 | Scalability  | Handle 1 000 shortens/sec, 10 000 redirects/sec        |
 
-### Back-of-the-Envelope Estimations
+#### Back-of-the-Envelope Estimations
 
 ```
 Read : Write ratio          ≈ 100 : 1
@@ -58,9 +59,7 @@ Cache (20% hot URLs)        ≈ 100 M × 0.2 × 500 B ≈ 10 GB (fits in Redis)
 
 A 7-character code using `[a-zA-Z0-9]` gives 62^7 ≈ 3.5 trillion combinations, which is more than enough for the estimated 6 billion total URLs over 5 years. Caching the top 20% of hot URLs in Redis keeps redirect latency under 10 ms.
 
----
-
-## High-Level Architecture
+### High-Level Architecture
 
 ```
                         ┌──────────────┐
@@ -91,128 +90,152 @@ A 7-character code using `[a-zA-Z0-9]` gives 62^7 ≈ 3.5 trillion combinations,
 
 The client sends a request to the load balancer, which forwards it to one of the FastAPI instances running on Cloud Run. For redirects, the API checks Redis first (cache hit returns in < 10 ms). On a cache miss, it queries PostgreSQL, caches the result, and redirects. For new URLs, the API generates a short code, stores it in PostgreSQL, and writes through to Redis.
 
----
+### Create the Minimal Project
 
-## Project Setup
+In this first step we create the bare minimum: a FastAPI app with a single `/health` endpoint, a Dockerfile, and a Docker Compose file with only the `api` service. No database, no Redis.
 
-### Project Structure
+**Project structure so far:**
 
 ```
 url-shortener/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py               # FastAPI application entry point
-│   ├── config.py             # Settings and environment variables
-│   ├── models.py             # SQLAlchemy ORM models
-│   ├── schemas.py            # Pydantic request/response schemas
-│   ├── database.py           # Database connection and session
-│   ├── cache.py              # Redis cache layer
-│   ├── shortener.py          # URL shortening algorithm
-│   ├── rate_limiter.py       # Rate limiting middleware
-│   └── routers/
-│       ├── __init__.py
-│       ├── urls.py           # Shorten & redirect endpoints
-│       └── analytics.py     # Analytics endpoints
-├── tests/
-│   ├── __init__.py
-│   ├── conftest.py           # Shared test fixtures
-│   ├── test_shorten.py       # Tests for shortening logic
-│   └── test_redirect.py     # Tests for redirection
-├── alembic/                  # Database migrations
-│   ├── versions/
-│   └── env.py
-├── alembic.ini
+│   └── main.py
 ├── Dockerfile
 ├── compose.yaml
-├── requirements.txt
-├── .env
-├── .dockerignore
-└── README.md
+└── requirements.txt
 ```
 
-### Create Virtual Environment & Install Dependencies
+#### **NEW** `requirements.txt`
+
+```text
+fastapi[standard]==0.115.0
+```
+
+`fastapi[standard]` includes `uvicorn` and `pydantic`.
+
+#### **NEW** `app/__init__.py`
+
+```python
+# empty – marks this directory as a Python package
+```
+
+#### **NEW** `app/main.py`
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A production-ready URL shortening service",
+    version="1.0.0",
+)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+```
+
+#### **NEW** `Dockerfile`
+
+```dockerfile
+FROM python:3.14-slim AS builder
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.14-slim
+
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY . .
+
+EXPOSE 8000
+
+CMD ["fastapi", "run", "app/main.py", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+This uses a multi-stage build. The `builder` stage installs dependencies into `/install`. The second stage copies only the installed packages, keeping the final image small by excluding pip caches and build artifacts. `--host 0.0.0.0` binds to all interfaces so the container is reachable from outside.
+
+#### **NEW** `compose.yaml`
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+```
+
+### Build, Run & Verify
 
 ```bash
 mkdir url-shortener && cd url-shortener
-python -m venv venv
-source venv/bin/activate              # macOS/Linux
+# Create the files listed above, then:
+
+docker compose up --build
 ```
 
-### `requirements.txt`
+In another terminal:
+
+```bash
+curl http://localhost:8000/health
+```
+
+**Expected output:**
+
+```json
+{"status":"healthy"}
+```
+
+Visit `http://localhost:8000/docs` for the interactive API documentation.
+
+Stop the stack with `Ctrl+C` or `docker compose down`.
+
+---
+
+## Step 2 — Connect to PostgreSQL
+
+We now add a PostgreSQL database, wire it into the FastAPI app, and verify the connection.
+
+**Project structure so far:**
+
+```
+url-shortener/
+├── app/
+│   ├── __init__.py
+│   ├── main.py          ← UPDATED
+│   ├── config.py        ← NEW
+│   └── database.py      ← NEW
+├── Dockerfile
+├── compose.yaml         ← UPDATED
+├── requirements.txt     ← UPDATED
+└── .env                 ← NEW
+```
+
+#### **UPDATED** `requirements.txt`
 
 ```text
 fastapi[standard]==0.115.0
 sqlalchemy==2.0.35
 psycopg2-binary==2.9.10
-alembic==1.13.3
-redis==5.1.1
 python-dotenv==1.0.1
-httpx==0.27.2
-pytest==8.3.3
-pytest-asyncio==0.24.0
+pydantic-settings==2.5.2
 ```
 
-`fastapi[standard]` includes `uvicorn` and `pydantic`. `sqlalchemy` is the ORM for PostgreSQL. `psycopg2-binary` is the PostgreSQL driver. `alembic` handles database migrations. `redis` is the Python client for Redis. `python-dotenv` loads `.env` files. `httpx` is used for async HTTP requests and testing. `pytest` and `pytest-asyncio` are the testing framework and its async plugin.
+`sqlalchemy` is the ORM for PostgreSQL. `psycopg2-binary` is the PostgreSQL driver. `python-dotenv` loads `.env` files. `pydantic-settings` provides `BaseSettings` for typed configuration.
+
+#### **NEW** `.env`
 
 ```bash
-pip install -r requirements.txt
-```
-
-### Environment Variables (`.env`)
-
-```bash
-DATABASE_URL=postgresql://user:pass@localhost:5432/urlshortener
-REDIS_URL=redis://localhost:6379/0
+DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
 BASE_URL=http://localhost:8000
-SHORT_CODE_LENGTH=7
-DEFAULT_TTL_DAYS=365
-RATE_LIMIT_PER_MINUTE=60
 ```
 
-`DATABASE_URL` follows the SQLAlchemy connection string format. `REDIS_URL` points to the local Redis instance. `BASE_URL` is the public-facing domain used to construct full short URLs. `SHORT_CODE_LENGTH` controls how many characters the generated code has. `DEFAULT_TTL_DAYS` sets the default expiration for new links. `RATE_LIMIT_PER_MINUTE` caps how many requests a single IP can make.
-
----
-
-## Database Design
-
-### Entity-Relationship Diagram
-
-```
-┌──────────────────────────────────────┐
-│              urls                     │
-├──────────────────────────────────────┤
-│ id            BIGSERIAL  PRIMARY KEY  │
-│ short_code    VARCHAR(10) UNIQUE      │
-│ original_url  TEXT        NOT NULL    │
-│ created_at    TIMESTAMPTZ DEFAULT NOW │
-│ expires_at    TIMESTAMPTZ NULL        │
-│ click_count   BIGINT     DEFAULT 0    │
-│ is_active     BOOLEAN    DEFAULT TRUE │
-│ user_ip       VARCHAR(45)             │
-├──────────────────────────────────────┤
-│ INDEX idx_short_code (short_code)     │
-│ INDEX idx_expires_at (expires_at)     │
-└──────────────────────────────────────┘
-
-┌──────────────────────────────────────┐
-│            click_events               │
-├──────────────────────────────────────┤
-│ id            BIGSERIAL  PRIMARY KEY  │
-│ url_id        BIGINT     FK → urls.id │
-│ clicked_at    TIMESTAMPTZ DEFAULT NOW │
-│ referrer      TEXT                     │
-│ user_agent    TEXT                     │
-│ ip_address    VARCHAR(45)             │
-│ country       VARCHAR(2)              │
-├──────────────────────────────────────┤
-│ INDEX idx_url_id (url_id)             │
-│ INDEX idx_clicked_at (clicked_at)     │
-└──────────────────────────────────────┘
-```
-
-The `urls` table stores the mapping between short codes and original URLs. `short_code` has a unique index for fast lookups during redirects. `click_count` is a denormalized counter for quick reads without joining. The `click_events` table stores granular per-click data for analytics. Separating events from the URL record avoids locking the URL row on every redirect and lets you run analytics queries independently.
-
-### `app/config.py`
+#### **NEW** `app/config.py`
 
 ```python
 from pydantic_settings import BaseSettings
@@ -220,11 +243,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
-    redis_url: str = "redis://localhost:6379/0"
     base_url: str = "http://localhost:8000"
-    short_code_length: int = 7
-    default_ttl_days: int = 365
-    rate_limit_per_minute: int = 60
 
     class Config:
         env_file = ".env"
@@ -235,7 +254,7 @@ settings = Settings()
 
 `BaseSettings` from `pydantic_settings` automatically reads values from environment variables and `.env` files. Field names are case-insensitive and map to the corresponding `ENV_VAR` names. The `Config` inner class tells Pydantic to also load from the `.env` file.
 
-### `app/database.py`
+#### **NEW** `app/database.py`
 
 ```python
 from sqlalchemy import create_engine
@@ -268,15 +287,152 @@ def get_db():
 
 `pool_size=20` keeps 20 connections open and reusable, avoiding the overhead of creating a new connection per request. `max_overflow=10` allows up to 10 additional connections under burst traffic. `pool_pre_ping=True` sends a lightweight query before each checkout to detect stale connections, which is important for cloud databases that may close idle connections. `get_db()` is a FastAPI dependency that yields a session and ensures it is closed after the request, even if an error occurs.
 
-### `app/models.py`
+#### **UPDATED** `app/main.py`
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.database import Base, engine
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create tables on startup."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A production-ready URL shortening service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+```
+
+`lifespan` is an async context manager that runs setup code before the app starts accepting requests (`Base.metadata.create_all` creates missing tables) and teardown code after shutdown. The health check endpoint at `/health` is used by load balancers and container orchestrators to verify the service is running.
+
+#### **UPDATED** `compose.yaml`
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - BASE_URL=http://localhost:8000
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
+```
+
+`depends_on` with `condition: service_healthy` ensures the API container waits until PostgreSQL passes its health check before starting. `pg_isready` is a PostgreSQL utility that checks if the server is accepting connections.
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Watch the logs. You should see the API start successfully after PostgreSQL is ready:
+
+```
+db-1   | ... database system is ready to accept connections
+api-1  | INFO:     Application startup complete.
+```
+
+In another terminal:
+
+```bash
+curl http://localhost:8000/health
+```
+
+**Expected output:**
+
+```json
+{"status":"healthy"}
+```
+
+---
+
+## Step 3 — URL Model + POST API + Tests
+
+We create the initial `URL` model (minimal — no click tracking or expiration yet), Pydantic schemas, the shortening algorithm, and the `POST /shorten` endpoint. We also add the first tests.
+
+**Project structure so far:**
+
+```
+url-shortener/
+├── app/
+│   ├── __init__.py
+│   ├── main.py          ← UPDATED
+│   ├── config.py
+│   ├── database.py
+│   ├── models.py        ← NEW
+│   ├── schemas.py       ← NEW
+│   ├── shortener.py     ← NEW
+│   └── routers/
+│       ├── __init__.py  ← NEW
+│       └── urls.py      ← NEW
+├── tests/
+│   ├── __init__.py      ← NEW
+│   ├── conftest.py      ← NEW
+│   └── test_shorten.py  ← NEW
+├── Dockerfile
+├── compose.yaml
+├── requirements.txt     ← UPDATED
+└── .env
+```
+
+#### **UPDATED** `requirements.txt`
+
+```text
+fastapi[standard]==0.115.0
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+pydantic-settings==2.5.2
+httpx==0.27.2
+pytest==8.3.3
+```
+
+`httpx` is used for async HTTP requests and testing. `pytest` is the testing framework.
+
+#### **NEW** `app/models.py`
 
 ```python
 from datetime import datetime, timezone
 
-from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, ForeignKey, Index, String, Text
-)
-from sqlalchemy.orm import relationship
+from sqlalchemy import BigInteger, Column, DateTime, String, Text
 
 from app.database import Base
 
@@ -291,43 +447,11 @@ class URL(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
     )
-    expires_at = Column(DateTime(timezone=True), nullable=True)
-    click_count = Column(BigInteger, default=0)
-    is_active = Column(Boolean, default=True)
-    user_ip = Column(String(45), nullable=True)
-
-    clicks = relationship("ClickEvent", back_populates="url")
-
-    __table_args__ = (
-        Index("idx_expires_at", "expires_at"),
-    )
-
-
-class ClickEvent(Base):
-    __tablename__ = "click_events"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    url_id = Column(BigInteger, ForeignKey("urls.id"), nullable=False)
-    clicked_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-    )
-    referrer = Column(Text, nullable=True)
-    user_agent = Column(Text, nullable=True)
-    ip_address = Column(String(45), nullable=True)
-    country = Column(String(2), nullable=True)
-
-    url = relationship("URL", back_populates="clicks")
-
-    __table_args__ = (
-        Index("idx_url_id", "url_id"),
-        Index("idx_clicked_at", "clicked_at"),
-    )
 ```
 
-`BigInteger` for `id` supports billions of rows. `String(45)` for IP addresses accommodates both IPv4 and IPv6. `DateTime(timezone=True)` stores timestamps with timezone information, which is critical for analytics across regions. `relationship()` sets up the ORM-level link between `URL` and `ClickEvent` so you can access `url.clicks` or `click.url` without writing joins manually. `__table_args__` adds composite or additional indexes beyond the ones declared inline on columns.
+We start with only the essential fields: `id`, `short_code`, `original_url`, and `created_at`. More fields will be added later. `BigInteger` for `id` supports billions of rows.
 
-### `app/schemas.py`
+#### **NEW** `app/schemas.py`
 
 ```python
 from datetime import datetime
@@ -336,8 +460,6 @@ from pydantic import BaseModel, HttpUrl
 
 class URLCreate(BaseModel):
     url: HttpUrl                              # Validates that input is a valid URL
-    custom_alias: str | None = None           # Optional custom short code
-    expires_in_days: int | None = None        # Optional TTL in days
 
 
 class URLResponse(BaseModel):
@@ -345,44 +467,387 @@ class URLResponse(BaseModel):
     short_url: str                            # Full shortened URL
     original_url: str
     created_at: datetime
-    expires_at: datetime | None
 
     class Config:
         from_attributes = True                # Allow ORM model → Pydantic conversion
-
-
-class URLStats(BaseModel):
-    short_code: str
-    original_url: str
-    click_count: int
-    created_at: datetime
-    expires_at: datetime | None
-    is_active: bool
-
-    class Config:
-        from_attributes = True
-
-
-class ClickEventResponse(BaseModel):
-    clicked_at: datetime
-    referrer: str | None
-    user_agent: str | None
-    ip_address: str | None
-    country: str | None
-
-    class Config:
-        from_attributes = True
 ```
 
 `HttpUrl` from Pydantic validates that the input string is a properly formatted URL, rejecting malformed inputs at the schema layer before any business logic runs. `from_attributes = True` (formerly `orm_mode`) tells Pydantic to read data from ORM model attributes instead of expecting a dictionary, enabling `URLResponse.model_validate(url_object)`.
 
+#### **NEW** `app/shortener.py`
+
+```python
+import string
+import random
+
+BASE62 = string.ascii_letters + string.digits   # a-zA-Z0-9 (62 chars)
+
+
+def encode_base62(num: int) -> str:
+    """Convert a positive integer to a Base62 string."""
+    if num == 0:
+        return BASE62[0]
+
+    result = []
+    while num > 0:
+        result.append(BASE62[num % 62])
+        num //= 62
+
+    return "".join(reversed(result))
+
+
+def generate_short_code(url_id: int, length: int = 7) -> str:
+    """
+    Generate a short code by Base62-encoding the database ID
+    and padding with random characters to reach the desired length.
+    """
+    base = encode_base62(url_id)
+
+    if len(base) >= length:
+        return base[:length]
+
+    # Pad with random Base62 characters to desired length
+    padding = "".join(random.choices(BASE62, k=length - len(base)))
+    return base + padding
+```
+
+`encode_base62` converts an integer to a Base62 string by repeatedly dividing by 62 and mapping remainders to `[a-zA-Z0-9]`. For example, ID `12345` becomes `"dnh"`. `generate_short_code` takes the database-assigned auto-increment ID, encodes it, and pads with random characters so the code is always exactly `length` characters. The random padding prevents users from guessing the next short code by incrementing.
+
+#### **NEW** `app/routers/__init__.py`
+
+```python
+# empty – marks this directory as a Python package
+```
+
+#### **NEW** `app/routers/urls.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import URL
+from app.schemas import URLCreate, URLResponse
+from app.shortener import generate_short_code
+
+router = APIRouter()
+
+
+@router.post("/shorten", response_model=URLResponse, status_code=201)
+def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
+    """Create a shortened URL."""
+    original_url = str(payload.url)
+
+    # Create the URL record
+    url_record = URL(
+        short_code="placeholder",             # Temporary, replaced below
+        original_url=original_url,
+    )
+
+    db.add(url_record)
+    db.flush()                                # Get the auto-generated ID
+
+    # Generate short code from ID
+    url_record.short_code = generate_short_code(url_record.id)
+
+    db.commit()
+    db.refresh(url_record)
+
+    return URLResponse(
+        short_code=url_record.short_code,
+        short_url=f"{settings.base_url}/{url_record.short_code}",
+        original_url=url_record.original_url,
+        created_at=url_record.created_at,
+    )
+```
+
+`db.flush()` sends the INSERT to the database and populates `url_record.id` without committing the transaction. This lets us use the auto-generated ID to create the short code, then commit everything atomically.
+
+#### **UPDATED** `app/main.py`
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.database import Base, engine
+from app.routers import urls
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create tables on startup."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A production-ready URL shortening service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.include_router(urls.router)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+```
+
+`include_router` mounts the URL router so the `POST /shorten` endpoint is accessible.
+
+#### **NEW** `tests/__init__.py`
+
+```python
+# empty
+```
+
+#### **NEW** `tests/conftest.py`
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.database import Base, get_db
+from app.main import app
+
+TEST_DATABASE_URL = "sqlite:///./test.db"
+
+engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
+TestSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+@pytest.fixture(autouse=True)
+def setup_db():
+    """Create tables before each test, drop them after."""
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def db():
+    """Provide a database session for tests."""
+    session = TestSession()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture
+def client(db):
+    """Override the database dependency with the test database."""
+    def override_get_db():
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+```
+
+Tests use SQLite instead of PostgreSQL for speed and isolation. `dependency_overrides` is a FastAPI feature that lets you swap out dependencies during testing. Every test gets a fresh database because `setup_db` creates tables before and drops them after each test. `TestClient` from FastAPI wraps `httpx` and provides a synchronous interface for making requests to the app without running a server.
+
+#### **NEW** `tests/test_shorten.py`
+
+```python
+def test_shorten_url(client):
+    """Test creating a shortened URL."""
+    response = client.post("/shorten", json={"url": "https://www.example.com"})
+    assert response.status_code == 201
+    data = response.json()
+    assert "short_code" in data
+    assert "short_url" in data
+    assert data["original_url"] == "https://www.example.com/"
+
+
+def test_invalid_url_rejected(client):
+    """Test that invalid URLs are rejected."""
+    response = client.post("/shorten", json={"url": "not-a-url"})
+    assert response.status_code == 422
+```
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+In another terminal, shorten a URL:
+
+```bash
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com/very/long/path"}'
+```
+
+**Expected output (short_code will vary):**
+
+```json
+{
+  "short_code": "bXkRzPq",
+  "short_url": "http://localhost:8000/bXkRzPq",
+  "original_url": "https://www.example.com/very/long/path",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+Run the tests locally (install deps in a venv first):
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pytest -v tests/test_shorten.py
+```
+
+**Expected output:**
+
+```
+tests/test_shorten.py::test_shorten_url PASSED
+tests/test_shorten.py::test_invalid_url_rejected PASSED
+```
+
 ---
 
-## URL Shortening Algorithm
+## Step 4 — Redirect Endpoint + Tests
 
-The core challenge is generating a unique, short, and collision-resistant code for each URL. There are several approaches:
+We add the `GET /{short_code}` redirect endpoint (simple version — no cache, no click tracking, no expiration check yet) and its tests.
+
+**Changed files:**
+
+```
+app/routers/urls.py      ← UPDATED
+tests/test_redirect.py   ← NEW
+```
+
+#### **UPDATED** `app/routers/urls.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import URL
+from app.schemas import URLCreate, URLResponse
+from app.shortener import generate_short_code
+
+router = APIRouter()
+
+
+@router.post("/shorten", response_model=URLResponse, status_code=201)
+def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
+    """Create a shortened URL."""
+    original_url = str(payload.url)
+
+    # Create the URL record
+    url_record = URL(
+        short_code="placeholder",             # Temporary, replaced below
+        original_url=original_url,
+    )
+
+    db.add(url_record)
+    db.flush()                                # Get the auto-generated ID
+
+    # Generate short code from ID
+    url_record.short_code = generate_short_code(url_record.id)
+
+    db.commit()
+    db.refresh(url_record)
+
+    return URLResponse(
+        short_code=url_record.short_code,
+        short_url=f"{settings.base_url}/{url_record.short_code}",
+        original_url=url_record.original_url,
+        created_at=url_record.created_at,
+    )
+
+
+@router.get("/{short_code}")
+def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
+    """Redirect a short code to its original URL."""
+    url_record = db.query(URL).filter(URL.short_code == short_code).first()
+
+    if not url_record:
+        raise HTTPException(status_code=404, detail="Short URL not found.")
+
+    return RedirectResponse(
+        url=url_record.original_url,
+        status_code=301,                      # Permanent redirect (cacheable)
+    )
+```
+
+`RedirectResponse` with status `301` tells browsers and CDNs to cache the redirect, reducing repeat traffic to the server. Use `302` instead if you need to track every click (browsers won't cache `302` redirects).
+
+#### **NEW** `tests/test_redirect.py`
+
+```python
+def test_redirect(client):
+    """Test that short codes redirect to the original URL."""
+    create = client.post("/shorten", json={"url": "https://www.example.com"})
+    short_code = create.json()["short_code"]
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+    assert response.status_code == 301
+    assert response.headers["location"] == "https://www.example.com/"
+
+
+def test_redirect_not_found(client):
+    """Test 404 for non-existent short codes."""
+    response = client.get("/nonexistent", follow_redirects=False)
+    assert response.status_code == 404
+```
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Create a URL and follow the redirect:
+
+```bash
+# Shorten
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com/very/long/path"}'
+
+# Redirect (follow redirects with -L)
+curl -L http://localhost:8000/<short_code>
+```
+
+Run the tests:
+
+```bash
+pytest -v tests/test_redirect.py
+```
+
+**Expected output:**
+
+```
+tests/test_redirect.py::test_redirect PASSED
+tests/test_redirect.py::test_redirect_not_found PASSED
+```
+
+---
+
+## Step 5 — Better Algorithms, Custom Aliases & Expiration
+
+We now enhance the system with multiple shortening algorithms, custom alias support, URL expiration, and click counting.
 
 ### Approach Comparison
+
+The core challenge is generating a unique, short, and collision-resistant code for each URL. There are several approaches:
 
 | Approach           | Pros                           | Cons                                          |
 | ------------------ | ------------------------------ | --------------------------------------------- |
@@ -394,7 +859,18 @@ The core challenge is generating a unique, short, and collision-resistant code f
 
 For this project, we use **Base62 encoding of an auto-incrementing counter** combined with **random padding** to prevent sequential guessing.
 
-### `app/shortener.py`
+**Changed files:**
+
+```
+app/shortener.py         ← UPDATED
+app/schemas.py           ← UPDATED
+app/models.py            ← UPDATED
+app/routers/urls.py      ← UPDATED
+tests/test_shorten.py    ← UPDATED
+tests/test_redirect.py   ← UPDATED
+```
+
+#### **UPDATED** `app/shortener.py`
 
 ```python
 import hashlib
@@ -448,9 +924,9 @@ def is_valid_alias(alias: str) -> bool:
     return all(c in BASE62 for c in alias) and 3 <= len(alias) <= 20
 ```
 
-`encode_base62` converts an integer to a Base62 string by repeatedly dividing by 62 and mapping remainders to `[a-zA-Z0-9]`. For example, ID `12345` becomes `"dnh"`. `generate_short_code` takes the database-assigned auto-increment ID, encodes it, and pads with random characters so the code is always exactly `length` characters. The random padding prevents users from guessing the next short code by incrementing. `generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL. `is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long. **For Production use Snowflake Id with Base62 encoding without truncation or random padding.**
+`generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL. `is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long. **For Production use Snowflake Id with Base62 encoding without truncation or random padding.**
 
-### Production: Snowflake ID + Base62
+#### Production: Snowflake ID + Base62
 
 ```python
 import time, threading, string
@@ -505,11 +981,101 @@ def generate_short_code() -> str:
 
 Each call to `next_id()` assembles a 64-bit int from a millisecond timestamp (41 bits), a machine identifier (10 bits, supporting 1,024 workers), and a sequence counter (12 bits, 4,096 IDs per millisecond). Base62-encoding this directly produces an **~11-character** code that is unique, time-sortable, and non-sequential — no retries or DB lookups needed.
 
----
+#### **UPDATED** `app/schemas.py`
 
-## Core API – Shorten & Redirect
+```python
+from datetime import datetime
+from pydantic import BaseModel, HttpUrl
 
-### `app/routers/urls.py`
+
+class URLCreate(BaseModel):
+    url: HttpUrl                              # Validates that input is a valid URL
+    custom_alias: str | None = None           # Optional custom short code
+    expires_in_days: int | None = None        # Optional TTL in days
+
+
+class URLResponse(BaseModel):
+    short_code: str
+    short_url: str                            # Full shortened URL
+    original_url: str
+    created_at: datetime
+    expires_at: datetime | None
+
+    class Config:
+        from_attributes = True                # Allow ORM model → Pydantic conversion
+
+
+class URLStats(BaseModel):
+    short_code: str
+    original_url: str
+    click_count: int
+    created_at: datetime
+    expires_at: datetime | None
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+```
+
+`custom_alias` and `expires_in_days` are now part of the create schema. `URLStats` is added for analytics (used in a later step).
+
+#### Entity-Relationship Diagram
+
+```
+┌──────────────────────────────────────┐
+│              urls                     │
+├──────────────────────────────────────┤
+│ id            BIGSERIAL  PRIMARY KEY  │
+│ short_code    VARCHAR(10) UNIQUE      │
+│ original_url  TEXT        NOT NULL    │
+│ created_at    TIMESTAMPTZ DEFAULT NOW │
+│ expires_at    TIMESTAMPTZ NULL        │
+│ click_count   BIGINT     DEFAULT 0    │
+│ is_active     BOOLEAN    DEFAULT TRUE │
+│ user_ip       VARCHAR(45)             │
+├──────────────────────────────────────┤
+│ INDEX idx_short_code (short_code)     │
+│ INDEX idx_expires_at (expires_at)     │
+└──────────────────────────────────────┘
+```
+
+The `urls` table stores the mapping between short codes and original URLs. `short_code` has a unique index for fast lookups during redirects. `click_count` is a denormalized counter for quick reads without joining.
+
+#### **UPDATED** `app/models.py`
+
+```python
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    BigInteger, Boolean, Column, DateTime, Index, String, Text
+)
+
+from app.database import Base
+
+
+class URL(Base):
+    __tablename__ = "urls"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    short_code = Column(String(10), unique=True, nullable=False, index=True)
+    original_url = Column(Text, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    click_count = Column(BigInteger, default=0)
+    is_active = Column(Boolean, default=True)
+    user_ip = Column(String(45), nullable=True)
+
+    __table_args__ = (
+        Index("idx_expires_at", "expires_at"),
+    )
+```
+
+We added `expires_at`, `click_count`, `is_active`, and `user_ip` to the URL model. `String(45)` for IP addresses accommodates both IPv4 and IPv6. `DateTime(timezone=True)` stores timestamps with timezone information, which is critical for analytics across regions. The `ClickEvent` model and `clicks` relationship will be added in Step 8.
+
+#### **UPDATED** `app/routers/urls.py`
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -603,51 +1169,262 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     )
 ```
 
-`db.flush()` sends the INSERT to the database and populates `url_record.id` without committing the transaction. This lets us use the auto-generated ID to create the short code, then commit everything atomically. `RedirectResponse` with status `301` tells browsers and CDNs to cache the redirect, reducing repeat traffic to the server. Use `302` instead if you need to track every click (browsers won't cache `302` redirects). `request.client.host` captures the caller's IP address for analytics and rate limiting.
+The POST endpoint now handles custom aliases (validating and checking for duplicates) and expiration. The GET endpoint now checks `is_active` and `expires_at` before redirecting, and increments the click counter. `request.client.host` captures the caller's IP address for analytics and rate limiting.
 
-### `app/main.py`
+#### **UPDATED** `app/config.py`
 
 ```python
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI
-
-from app.database import Base, engine
-from app.routers import urls, analytics
+from pydantic_settings import BaseSettings
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Create tables on startup."""
-    Base.metadata.create_all(bind=engine)
-    yield
+class Settings(BaseSettings):
+    database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
+    base_url: str = "http://localhost:8000"
+    short_code_length: int = 7
+    default_ttl_days: int = 365
+
+    class Config:
+        env_file = ".env"
 
 
-app = FastAPI(
-    title="URL Shortener API",
-    description="A production-ready URL shortening service",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.include_router(urls.router)
-app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
-
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
+settings = Settings()
 ```
 
-`lifespan` is an async context manager that runs setup code before the app starts accepting requests (`Base.metadata.create_all` creates missing tables) and teardown code after shutdown. `include_router` mounts the URL and analytics routers. The health check endpoint at `/health` is used by load balancers and container orchestrators to verify the service is running.
+Added `short_code_length` and `default_ttl_days` configuration fields.
+
+#### **UPDATED** `tests/test_shorten.py`
+
+```python
+def test_shorten_url(client):
+    """Test creating a shortened URL."""
+    response = client.post("/shorten", json={"url": "https://www.example.com"})
+    assert response.status_code == 201
+    data = response.json()
+    assert "short_code" in data
+    assert "short_url" in data
+    assert data["original_url"] == "https://www.example.com/"
+
+
+def test_shorten_with_custom_alias(client):
+    """Test creating a URL with a custom alias."""
+    response = client.post(
+        "/shorten",
+        json={"url": "https://www.example.com", "custom_alias": "mylink"},
+    )
+    assert response.status_code == 201
+    assert response.json()["short_code"] == "mylink"
+
+
+def test_duplicate_alias_rejected(client):
+    """Test that duplicate custom aliases are rejected."""
+    client.post(
+        "/shorten",
+        json={"url": "https://www.example.com", "custom_alias": "taken"},
+    )
+    response = client.post(
+        "/shorten",
+        json={"url": "https://www.other.com", "custom_alias": "taken"},
+    )
+    assert response.status_code == 409
+
+
+def test_invalid_alias_rejected(client):
+    """Test that invalid aliases are rejected."""
+    response = client.post(
+        "/shorten",
+        json={"url": "https://www.example.com", "custom_alias": "a"},
+    )
+    assert response.status_code == 400
+
+
+def test_invalid_url_rejected(client):
+    """Test that invalid URLs are rejected."""
+    response = client.post("/shorten", json={"url": "not-a-url"})
+    assert response.status_code == 422
+```
+
+#### **UPDATED** `tests/test_redirect.py`
+
+```python
+def test_redirect(client):
+    """Test that short codes redirect to the original URL."""
+    create = client.post("/shorten", json={"url": "https://www.example.com"})
+    short_code = create.json()["short_code"]
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+    assert response.status_code == 301
+    assert response.headers["location"] == "https://www.example.com/"
+
+
+def test_redirect_not_found(client):
+    """Test 404 for non-existent short codes."""
+    response = client.get("/nonexistent", follow_redirects=False)
+    assert response.status_code == 404
+
+
+def test_click_count_increments(client, db):
+    """Test that clicks are tracked."""
+    create = client.post("/shorten", json={"url": "https://www.example.com"})
+    short_code = create.json()["short_code"]
+
+    client.get(f"/{short_code}", follow_redirects=False)
+    client.get(f"/{short_code}", follow_redirects=False)
+
+    # Query the DB directly since analytics router isn't added yet
+    from app.models import URL
+    url_record = db.query(URL).filter(URL.short_code == short_code).first()
+    assert url_record.click_count == 2
+```
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Test custom alias:
+
+```bash
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com", "custom_alias": "mylink"}'
+```
+
+Run all tests:
+
+```bash
+pytest -v
+```
+
+**Expected output:**
+
+```
+tests/test_shorten.py::test_shorten_url PASSED
+tests/test_shorten.py::test_shorten_with_custom_alias PASSED
+tests/test_shorten.py::test_duplicate_alias_rejected PASSED
+tests/test_shorten.py::test_invalid_alias_rejected PASSED
+tests/test_shorten.py::test_invalid_url_rejected PASSED
+tests/test_redirect.py::test_redirect PASSED
+tests/test_redirect.py::test_redirect_not_found PASSED
+tests/test_redirect.py::test_click_count_increments PASSED
+```
 
 ---
 
-## Caching with Redis
+## Step 6 — Caching with Redis
 
 Every redirect triggers a database query. At 10 000 reads/sec, PostgreSQL would buckle. Redis acts as a read-through cache, serving hot URLs from memory in < 1 ms.
 
-### `app/cache.py`
+**Changed files:**
+
+```
+compose.yaml             ← UPDATED
+app/config.py            ← UPDATED
+app/cache.py             ← NEW
+app/routers/urls.py      ← UPDATED
+requirements.txt         ← UPDATED
+.env                     ← UPDATED
+```
+
+#### **UPDATED** `requirements.txt`
+
+```text
+fastapi[standard]==0.115.0
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+pydantic-settings==2.5.2
+httpx==0.27.2
+pytest==8.3.3
+redis==5.1.1
+```
+
+#### **UPDATED** `.env`
+
+```bash
+DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+BASE_URL=http://localhost:8000
+REDIS_URL=redis://cache:6379/0
+```
+
+#### **UPDATED** `app/config.py`
+
+```python
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
+    redis_url: str = "redis://localhost:6379/0"
+    base_url: str = "http://localhost:8000"
+    short_code_length: int = 7
+    default_ttl_days: int = 365
+
+    class Config:
+        env_file = ".env"
+
+
+settings = Settings()
+```
+
+Added `redis_url`.
+
+#### **UPDATED** `compose.yaml`
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
+      - BASE_URL=http://localhost:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
+  redis-data:
+```
+
+`--appendonly yes` enables Redis AOF (Append-Only File) persistence, writing every operation to disk so data survives container restarts. `redis:7-alpine` is a minimal Redis image based on Alpine Linux, significantly smaller than the default image.
+
+#### **NEW** `app/cache.py`
 
 ```python
 import json
@@ -694,12 +1471,75 @@ def increment_click_count(short_code: str) -> int:
 
 `redis.from_url` parses the connection string and creates a connection pool automatically. `decode_responses=True` makes Redis return Python strings instead of bytes, avoiding `.decode()` calls everywhere. `setex` sets a key with an expiration time in seconds; after `CACHE_TTL` seconds, Redis automatically deletes the key. The `url:` prefix namespaces cache keys to avoid collisions with other data stored in the same Redis instance. `incr` is atomic, meaning concurrent requests will not lose counts, even without locks.
 
-### Update Redirect to Use Cache
-
-Update the redirect function in `app/routers/urls.py`:
+#### **UPDATED** `app/routers/urls.py`
 
 ```python
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import URL
+from app.schemas import URLCreate, URLResponse
+from app.shortener import generate_short_code, is_valid_alias
 from app.cache import get_cached_url, set_cached_url, increment_click_count
+
+router = APIRouter()
+
+
+@router.post("/shorten", response_model=URLResponse, status_code=201)
+def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
+    """Create a shortened URL."""
+    original_url = str(payload.url)
+
+    # Handle custom alias
+    if payload.custom_alias:
+        if not is_valid_alias(payload.custom_alias):
+            raise HTTPException(
+                status_code=400,
+                detail="Alias must be 3-20 alphanumeric characters.",
+            )
+
+        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Alias already taken.")
+
+        short_code = payload.custom_alias
+    else:
+        short_code = None                     # Will be generated after insert
+
+    # Calculate expiration
+    ttl_days = payload.expires_in_days or settings.default_ttl_days
+    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
+
+    # Create the URL record
+    url_record = URL(
+        short_code=short_code or "placeholder",  # Temporary, replaced below
+        original_url=original_url,
+        expires_at=expires_at,
+        user_ip=request.client.host,
+    )
+
+    db.add(url_record)
+    db.flush()                                # Get the auto-generated ID
+
+    # Generate short code from ID if no custom alias
+    if not payload.custom_alias:
+        url_record.short_code = generate_short_code(url_record.id)
+
+    db.commit()
+    db.refresh(url_record)
+
+    return URLResponse(
+        short_code=url_record.short_code,
+        short_url=f"{settings.base_url}/{url_record.short_code}",
+        original_url=url_record.original_url,
+        created_at=url_record.created_at,
+        expires_at=url_record.expires_at,
+    )
 
 
 @router.get("/{short_code}")
@@ -740,13 +1580,75 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
 
 The cache-aside pattern works as follows: check Redis first (step 1). If the URL is cached, increment the counter in Redis atomically and redirect immediately without touching PostgreSQL. On a cache miss (step 2), query the database and populate the cache (step 3) so subsequent requests hit Redis. In production, you would run a periodic batch job to sync `clicks:{short_code}` counters from Redis back to PostgreSQL's `click_count` column, combining Redis speed with PostgreSQL durability.
 
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Verify caching by curling a redirect twice and checking logs:
+
+```bash
+# Shorten a URL
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com"}'
+
+# First redirect — cache miss, hits the DB and populates cache
+curl -v http://localhost:8000/<short_code> 2>&1 | head -20
+
+# Second redirect — cache hit, served from Redis (faster)
+curl -v http://localhost:8000/<short_code> 2>&1 | head -20
+```
+
 ---
 
-## Rate Limiting
+## Step 7 — Rate Limiting
 
 Without rate limiting, a single client can overwhelm the service with requests. We implement a **sliding window** rate limiter using Redis.
 
-### `app/rate_limiter.py`
+**Changed files:**
+
+```
+app/rate_limiter.py      ← NEW
+app/main.py              ← UPDATED
+app/config.py            ← UPDATED
+.env                     ← UPDATED
+```
+
+#### **UPDATED** `.env`
+
+```bash
+DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+BASE_URL=http://localhost:8000
+REDIS_URL=redis://cache:6379/0
+RATE_LIMIT_PER_MINUTE=60
+```
+
+#### **UPDATED** `app/config.py`
+
+```python
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
+    redis_url: str = "redis://localhost:6379/0"
+    base_url: str = "http://localhost:8000"
+    short_code_length: int = 7
+    default_ttl_days: int = 365
+    rate_limit_per_minute: int = 60
+
+    class Config:
+        env_file = ".env"
+
+
+settings = Settings()
+```
+
+Added `rate_limit_per_minute`.
+
+#### **NEW** `app/rate_limiter.py`
 
 ```python
 import time
@@ -797,21 +1699,245 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
 
 A **sliding window** with Redis sorted sets is more accurate than fixed-window counters. Each request timestamp is stored as both the member and score in a sorted set keyed by client IP. `zremrangebyscore` removes entries older than 60 seconds, `zadd` adds the current request, and `zcard` counts the remaining entries. `pipeline()` sends all four commands in a single round trip, reducing latency. The `X-RateLimit-*` response headers inform the client of their remaining quota. `expire` ensures the key is automatically cleaned up even if the client disappears.
 
-### Register the Middleware
-
-Add to `app/main.py`:
+#### **UPDATED** `app/main.py`
 
 ```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.database import Base, engine
+from app.routers import urls
 from app.rate_limiter import RateLimiterMiddleware
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create tables on startup."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A production-ready URL shortening service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
 app.add_middleware(RateLimiterMiddleware)
+
+app.include_router(urls.router)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+```
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Demonstrate rate limiting by sending many requests rapidly:
+
+```bash
+# Send 65 rapid requests (limit is 60/min)
+for i in $(seq 1 65); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/health
+done
+```
+
+The first 60 requests return `200`. Requests 61+ return `429`:
+
+**Expected output (last few lines):**
+
+```
+200
+200
+429
+429
+429
+```
+
+Check the rate limit headers:
+
+```bash
+curl -v http://localhost:8000/health 2>&1 | grep -i x-ratelimit
+```
+
+**Expected output:**
+
+```
+< X-RateLimit-Limit: 60
+< X-RateLimit-Remaining: 59
 ```
 
 ---
 
-## Analytics & Click Tracking
+## Step 8 — Click Events Model + Analytics
 
-### `app/routers/analytics.py`
+We now add granular per-click tracking with the `ClickEvent` model and a full analytics router.
+
+**Changed files:**
+
+```
+app/models.py            ← UPDATED
+app/schemas.py           ← UPDATED
+app/routers/analytics.py ← NEW
+app/routers/urls.py      ← UPDATED
+app/main.py              ← UPDATED
+tests/test_redirect.py   ← UPDATED
+```
+
+#### Entity-Relationship Diagram (Final)
+
+```
+┌──────────────────────────────────────┐
+│              urls                     │
+├──────────────────────────────────────┤
+│ id            BIGSERIAL  PRIMARY KEY  │
+│ short_code    VARCHAR(10) UNIQUE      │
+│ original_url  TEXT        NOT NULL    │
+│ created_at    TIMESTAMPTZ DEFAULT NOW │
+│ expires_at    TIMESTAMPTZ NULL        │
+│ click_count   BIGINT     DEFAULT 0    │
+│ is_active     BOOLEAN    DEFAULT TRUE │
+│ user_ip       VARCHAR(45)             │
+├──────────────────────────────────────┤
+│ INDEX idx_short_code (short_code)     │
+│ INDEX idx_expires_at (expires_at)     │
+└──────────────────────────────────────┘
+
+┌──────────────────────────────────────┐
+│            click_events               │
+├──────────────────────────────────────┤
+│ id            BIGSERIAL  PRIMARY KEY  │
+│ url_id        BIGINT     FK → urls.id │
+│ clicked_at    TIMESTAMPTZ DEFAULT NOW │
+│ referrer      TEXT                     │
+│ user_agent    TEXT                     │
+│ ip_address    VARCHAR(45)             │
+│ country       VARCHAR(2)              │
+├──────────────────────────────────────┤
+│ INDEX idx_url_id (url_id)             │
+│ INDEX idx_clicked_at (clicked_at)     │
+└──────────────────────────────────────┘
+```
+
+The `click_events` table stores granular per-click data for analytics. Separating events from the URL record avoids locking the URL row on every redirect and lets you run analytics queries independently.
+
+#### **UPDATED** `app/models.py`
+
+```python
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    BigInteger, Boolean, Column, DateTime, ForeignKey, Index, String, Text
+)
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+class URL(Base):
+    __tablename__ = "urls"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    short_code = Column(String(10), unique=True, nullable=False, index=True)
+    original_url = Column(Text, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    click_count = Column(BigInteger, default=0)
+    is_active = Column(Boolean, default=True)
+    user_ip = Column(String(45), nullable=True)
+
+    clicks = relationship("ClickEvent", back_populates="url")
+
+    __table_args__ = (
+        Index("idx_expires_at", "expires_at"),
+    )
+
+
+class ClickEvent(Base):
+    __tablename__ = "click_events"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    url_id = Column(BigInteger, ForeignKey("urls.id"), nullable=False)
+    clicked_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    referrer = Column(Text, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    country = Column(String(2), nullable=True)
+
+    url = relationship("URL", back_populates="clicks")
+
+    __table_args__ = (
+        Index("idx_url_id", "url_id"),
+        Index("idx_clicked_at", "clicked_at"),
+    )
+```
+
+`relationship()` sets up the ORM-level link between `URL` and `ClickEvent` so you can access `url.clicks` or `click.url` without writing joins manually. `__table_args__` adds composite or additional indexes beyond the ones declared inline on columns.
+
+#### **UPDATED** `app/schemas.py`
+
+```python
+from datetime import datetime
+from pydantic import BaseModel, HttpUrl
+
+
+class URLCreate(BaseModel):
+    url: HttpUrl                              # Validates that input is a valid URL
+    custom_alias: str | None = None           # Optional custom short code
+    expires_in_days: int | None = None        # Optional TTL in days
+
+
+class URLResponse(BaseModel):
+    short_code: str
+    short_url: str                            # Full shortened URL
+    original_url: str
+    created_at: datetime
+    expires_at: datetime | None
+
+    class Config:
+        from_attributes = True                # Allow ORM model → Pydantic conversion
+
+
+class URLStats(BaseModel):
+    short_code: str
+    original_url: str
+    click_count: int
+    created_at: datetime
+    expires_at: datetime | None
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class ClickEventResponse(BaseModel):
+    clicked_at: datetime
+    referrer: str | None
+    user_agent: str | None
+    ip_address: str | None
+    country: str | None
+
+    class Config:
+        from_attributes = True
+```
+
+`ClickEventResponse` is the new schema for returning individual click events.
+
+#### **NEW** `app/routers/analytics.py`
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -918,36 +2044,198 @@ def get_click_summary(short_code: str, db: Session = Depends(get_db)):
 
 `Query(0, ge=0)` uses FastAPI's `Query` with validation: `ge=0` ensures the offset is not negative. `func.date()` extracts the date part from a timestamp for grouping clicks by day. `group_by` + `func.count()` aggregates rows in SQL, which is far more efficient than fetching all rows and counting in Python. `order_by(...desc())` returns the most recent results first. `.limit(10)` on referrers and countries returns only the top 10 to keep the response size manageable.
 
-### Update Redirect to Record Click Events
-
-Update the redirect function to log detailed click events:
+#### **UPDATED** `app/routers/urls.py`
 
 ```python
-from app.models import ClickEvent
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import URL, ClickEvent
+from app.schemas import URLCreate, URLResponse
+from app.shortener import generate_short_code, is_valid_alias
+from app.cache import get_cached_url, set_cached_url, increment_click_count
+
+router = APIRouter()
 
 
-# Inside redirect_to_url, before db.commit():
-click_event = ClickEvent(
-    url_id=url_record.id,
-    referrer=request.headers.get("referer"),      # Note: HTTP header is "referer"
-    user_agent=request.headers.get("user-agent"),
-    ip_address=request.client.host,
-    country=None,                                  # Populated by GeoIP service
-)
-db.add(click_event)
-url_record.click_count += 1
-db.commit()
+@router.post("/shorten", response_model=URLResponse, status_code=201)
+def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
+    """Create a shortened URL."""
+    original_url = str(payload.url)
+
+    # Handle custom alias
+    if payload.custom_alias:
+        if not is_valid_alias(payload.custom_alias):
+            raise HTTPException(
+                status_code=400,
+                detail="Alias must be 3-20 alphanumeric characters.",
+            )
+
+        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Alias already taken.")
+
+        short_code = payload.custom_alias
+    else:
+        short_code = None                     # Will be generated after insert
+
+    # Calculate expiration
+    ttl_days = payload.expires_in_days or settings.default_ttl_days
+    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
+
+    # Create the URL record
+    url_record = URL(
+        short_code=short_code or "placeholder",  # Temporary, replaced below
+        original_url=original_url,
+        expires_at=expires_at,
+        user_ip=request.client.host,
+    )
+
+    db.add(url_record)
+    db.flush()                                # Get the auto-generated ID
+
+    # Generate short code from ID if no custom alias
+    if not payload.custom_alias:
+        url_record.short_code = generate_short_code(url_record.id)
+
+    db.commit()
+    db.refresh(url_record)
+
+    return URLResponse(
+        short_code=url_record.short_code,
+        short_url=f"{settings.base_url}/{url_record.short_code}",
+        original_url=url_record.original_url,
+        created_at=url_record.created_at,
+        expires_at=url_record.expires_at,
+    )
+
+
+@router.get("/{short_code}")
+def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
+    """Redirect with Redis cache layer and click event recording."""
+
+    # 1. Check cache first
+    cached = get_cached_url(short_code)
+    if cached:
+        increment_click_count(short_code)
+        return RedirectResponse(url=cached["original_url"], status_code=301)
+
+    # 2. Cache miss → query database
+    url_record = db.query(URL).filter(URL.short_code == short_code).first()
+
+    if not url_record:
+        raise HTTPException(status_code=404, detail="Short URL not found.")
+
+    if not url_record.is_active:
+        raise HTTPException(status_code=410, detail="This link has been deactivated.")
+
+    if url_record.expires_at and url_record.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="This link has expired.")
+
+    # 3. Populate cache
+    set_cached_url(
+        short_code,
+        url_record.original_url,
+        url_record.expires_at.isoformat() if url_record.expires_at else None,
+    )
+
+    # 4. Record click event
+    click_event = ClickEvent(
+        url_id=url_record.id,
+        referrer=request.headers.get("referer"),      # Note: HTTP header is "referer"
+        user_agent=request.headers.get("user-agent"),
+        ip_address=request.client.host,
+        country=None,                                  # Populated by GeoIP service
+    )
+    db.add(click_event)
+
+    # 5. Update count and redirect
+    url_record.click_count += 1
+    db.commit()
+
+    return RedirectResponse(url=url_record.original_url, status_code=301)
 ```
 
 The HTTP `Referer` header (note the deliberate misspelling in the HTTP spec) tells you which page the user clicked the link from. In production, you would send click events to a message queue (Pub/Sub, Kafka) and process them asynchronously to avoid slowing down the redirect response.
 
----
+#### **UPDATED** `app/main.py`
 
-## Custom Aliases & Expiration
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.database import Base, engine
+from app.routers import urls, analytics
+from app.rate_limiter import RateLimiterMiddleware
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create tables on startup."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A production-ready URL shortening service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(RateLimiterMiddleware)
+
+app.include_router(urls.router)
+app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+```
+
+#### **UPDATED** `tests/test_redirect.py`
+
+```python
+def test_redirect(client):
+    """Test that short codes redirect to the original URL."""
+    create = client.post("/shorten", json={"url": "https://www.example.com"})
+    short_code = create.json()["short_code"]
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+    assert response.status_code == 301
+    assert response.headers["location"] == "https://www.example.com/"
+
+
+def test_redirect_not_found(client):
+    """Test 404 for non-existent short codes."""
+    response = client.get("/nonexistent", follow_redirects=False)
+    assert response.status_code == 404
+
+
+def test_click_count_increments(client):
+    """Test that clicks are tracked."""
+    create = client.post("/shorten", json={"url": "https://www.example.com"})
+    short_code = create.json()["short_code"]
+
+    client.get(f"/{short_code}", follow_redirects=False)
+    client.get(f"/{short_code}", follow_redirects=False)
+
+    stats = client.get(f"/api/analytics/{short_code}")
+    assert stats.json()["click_count"] == 2
+```
+
+### Custom Aliases & Expiration
 
 Custom aliases and TTL are already handled in the schemas and the shorten endpoint. Here is how expiration cleanup works:
 
-### Expiration Cleanup Job
+#### Expiration Cleanup Job
 
 ```python
 # app/cleanup.py
@@ -987,7 +2275,7 @@ if __name__ == "__main__":
 
 This script is designed to run as a **cron job** or Cloud Scheduler task (e.g., every hour). It queries for active URLs past their expiration, marks them inactive, and evicts them from Redis. Running cleanup as a separate process avoids adding latency to the redirect path. In production, you could schedule this with `Cloud Scheduler → Cloud Run Job` or a Kubernetes CronJob.
 
-### GCP Deployment: Cloud Scheduler → Cloud Run Job
+#### GCP Deployment: Cloud Scheduler → Cloud Run Job
 
 **Step 1 — Containerize the cleanup script**
 
@@ -1060,9 +2348,50 @@ gcloud scheduler jobs create http url-cleanup-schedule \
 
 `--schedule "0 * * * *"` triggers every hour at minute 0. Cloud Scheduler makes an authenticated HTTP POST to the Cloud Run Jobs API, which spins up a container, runs the cleanup, and shuts down — you pay only for execution time.
 
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Demonstrate the full flow:
+
+```bash
+# 1. Shorten a URL
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com/very/long/path"}'
+
+# 2. Click it a few times
+curl -L http://localhost:8000/<short_code>
+curl -L http://localhost:8000/<short_code>
+curl -L http://localhost:8000/<short_code>
+
+# 3. Check analytics
+curl http://localhost:8000/api/analytics/<short_code>
+
+# 4. Get detailed click summary
+curl http://localhost:8000/api/analytics/<short_code>/summary
+```
+
+**Expected analytics output:**
+
+```json
+{
+  "short_code": "bXkRzPq",
+  "original_url": "https://www.example.com/very/long/path",
+  "click_count": 3,
+  "created_at": "2024-01-15T10:30:00Z",
+  "expires_at": "2025-01-14T10:30:00Z",
+  "is_active": true
+}
+```
+
 ---
 
-## Docker & Docker Compose
+## Docker & Docker Compose (Final)
+
+This section recaps the final, complete Docker configuration that was built up incrementally through the steps above.
 
 ### `Dockerfile`
 
@@ -1180,7 +2509,9 @@ curl http://localhost:8000/api/analytics/abc1234/summary
 
 ---
 
-## Testing
+## Testing (Final)
+
+This section recaps the final, complete test files.
 
 ### `tests/conftest.py`
 
@@ -1322,6 +2653,89 @@ pytest -v                                     # Verbose output
 pytest --tb=short                             # Shorter tracebacks
 pytest -k "test_shorten"                      # Run only shorten tests
 ```
+
+---
+
+## Project Setup (Final)
+
+This section recaps the final, complete project structure and configuration.
+
+### Project Structure
+
+```
+url-shortener/
+├── app/
+│   ├── __init__.py
+│   ├── main.py               # FastAPI application entry point
+│   ├── config.py             # Settings and environment variables
+│   ├── models.py             # SQLAlchemy ORM models
+│   ├── schemas.py            # Pydantic request/response schemas
+│   ├── database.py           # Database connection and session
+│   ├── cache.py              # Redis cache layer
+│   ├── shortener.py          # URL shortening algorithm
+│   ├── rate_limiter.py       # Rate limiting middleware
+│   ├── cleanup.py            # Expiration cleanup job
+│   └── routers/
+│       ├── __init__.py
+│       ├── urls.py           # Shorten & redirect endpoints
+│       └── analytics.py     # Analytics endpoints
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py           # Shared test fixtures
+│   ├── test_shorten.py       # Tests for shortening logic
+│   └── test_redirect.py     # Tests for redirection
+├── alembic/                  # Database migrations
+│   ├── versions/
+│   └── env.py
+├── alembic.ini
+├── Dockerfile
+├── compose.yaml
+├── requirements.txt
+├── .env
+├── .dockerignore
+└── README.md
+```
+
+### Create Virtual Environment & Install Dependencies
+
+```bash
+mkdir url-shortener && cd url-shortener
+python -m venv venv
+source venv/bin/activate              # macOS/Linux
+```
+
+### `requirements.txt`
+
+```text
+fastapi[standard]==0.115.0
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.10
+alembic==1.13.3
+redis==5.1.1
+python-dotenv==1.0.1
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0
+```
+
+`fastapi[standard]` includes `uvicorn` and `pydantic`. `sqlalchemy` is the ORM for PostgreSQL. `psycopg2-binary` is the PostgreSQL driver. `alembic` handles database migrations. `redis` is the Python client for Redis. `python-dotenv` loads `.env` files. `httpx` is used for async HTTP requests and testing. `pytest` and `pytest-asyncio` are the testing framework and its async plugin.
+
+```bash
+pip install -r requirements.txt
+```
+
+### Environment Variables (`.env`)
+
+```bash
+DATABASE_URL=postgresql://user:pass@localhost:5432/urlshortener
+REDIS_URL=redis://localhost:6379/0
+BASE_URL=http://localhost:8000
+SHORT_CODE_LENGTH=7
+DEFAULT_TTL_DAYS=365
+RATE_LIMIT_PER_MINUTE=60
+```
+
+`DATABASE_URL` follows the SQLAlchemy connection string format. `REDIS_URL` points to the local Redis instance. `BASE_URL` is the public-facing domain used to construct full short URLs. `SHORT_CODE_LENGTH` controls how many characters the generated code has. `DEFAULT_TTL_DAYS` sets the default expiration for new links. `RATE_LIMIT_PER_MINUTE` caps how many requests a single IP can make.
 
 ---
 

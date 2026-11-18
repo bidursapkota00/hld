@@ -27,22 +27,22 @@ Before writing a single line of code, define what the system needs to do and est
 
 ### Functional Requirements
 
-| Requirement     | Description                                                      |
-| --------------- | ---------------------------------------------------------------- |
-| Shorten URL     | Given a long URL, generate a unique short link                   |
-| Redirect        | Given a short link, redirect to the original URL (HTTP 301/302)  |
-| Custom Alias    | Optionally let users choose their own short code                 |
-| Expiration      | URLs can have a TTL after which they stop working                |
-| Analytics       | Track click count, timestamp, referrer, and geolocation per link |
+| Requirement  | Description                                                      |
+| ------------ | ---------------------------------------------------------------- |
+| Shorten URL  | Given a long URL, generate a unique short link                   |
+| Redirect     | Given a short link, redirect to the original URL (HTTP 301/302)  |
+| Custom Alias | Optionally let users choose their own short code                 |
+| Expiration   | URLs can have a TTL after which they stop working                |
+| Analytics    | Track click count, timestamp, referrer, and geolocation per link |
 
 ### Non-Functional Requirements
 
-| Requirement      | Target                                                   |
-| ---------------- | -------------------------------------------------------- |
-| Availability     | 99.9% uptime                                             |
-| Latency          | Redirect in < 10 ms (cache hit) / < 50 ms (cache miss)  |
-| Durability       | No shortened link should ever be lost                    |
-| Scalability      | Handle 1 000 shortens/sec, 10 000 redirects/sec         |
+| Requirement  | Target                                                 |
+| ------------ | ------------------------------------------------------ |
+| Availability | 99.9% uptime                                           |
+| Latency      | Redirect in < 10 ms (cache hit) / < 50 ms (cache miss) |
+| Durability   | No shortened link should ever be lost                  |
+| Scalability  | Handle 1 000 shortens/sec, 10 000 redirects/sec        |
 
 ### Back-of-the-Envelope Estimations
 
@@ -384,13 +384,13 @@ The core challenge is generating a unique, short, and collision-resistant code f
 
 ### Approach Comparison
 
-| Approach            | Pros                             | Cons                                         |
-| ------------------- | -------------------------------- | -------------------------------------------- |
-| Random + Retry      | Simple, no coordination needed   | Collision risk under high load                |
-| Counter + Base62    | Zero collisions, predictable     | Requires distributed counter, codes guessable |
-| MD5/SHA256 + Trunc  | Deterministic, same URL → same   | Collision risk with truncation                |
-| Snowflake ID        | Globally unique, time-sortable   | Requires Snowflake service, long codes        |
-| Pre-generated Pool  | Fast, no runtime computation     | Requires key generation service               |
+| Approach           | Pros                           | Cons                                          |
+| ------------------ | ------------------------------ | --------------------------------------------- |
+| Random + Retry     | Simple, no coordination needed | Collision risk under high load                |
+| Counter + Base62   | Zero collisions, predictable   | Requires distributed counter, codes guessable |
+| MD5/SHA256 + Trunc | Deterministic, same URL → same | Collision risk with truncation                |
+| Snowflake ID       | Globally unique, time-sortable | Requires Snowflake service, long codes        |
+| Pre-generated Pool | Fast, no runtime computation   | Requires key generation service               |
 
 For this project, we use **Base62 encoding of an auto-incrementing counter** combined with **random padding** to prevent sequential guessing.
 
@@ -448,7 +448,7 @@ def is_valid_alias(alias: str) -> bool:
     return all(c in BASE62 for c in alias) and 3 <= len(alias) <= 20
 ```
 
-`encode_base62` converts an integer to a Base62 string by repeatedly dividing by 62 and mapping remainders to `[a-zA-Z0-9]`. For example, ID `12345` becomes `"dnh"`. `generate_short_code` takes the database-assigned auto-increment ID, encodes it, and pads with random characters so the code is always exactly `length` characters. The random padding prevents users from guessing the next short code by incrementing. `generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL. `is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long.
+`encode_base62` converts an integer to a Base62 string by repeatedly dividing by 62 and mapping remainders to `[a-zA-Z0-9]`. For example, ID `12345` becomes `"dnh"`. `generate_short_code` takes the database-assigned auto-increment ID, encodes it, and pads with random characters so the code is always exactly `length` characters. The random padding prevents users from guessing the next short code by incrementing. `generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL. `is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long. **For Production use Snowflake Id with Base62 encoding without truncation or random padding.**
 
 ---
 
@@ -1319,21 +1319,21 @@ gcloud scheduler jobs create http cleanup-expired-urls \
 
 ### Database Scaling
 
-| Strategy              | When to Use                               | How                                              |
-| --------------------- | ----------------------------------------- | ------------------------------------------------ |
-| Read Replicas         | Read-heavy workload (100:1 read/write)    | Cloud SQL read replicas + SQLAlchemy `bind` param |
-| Connection Pooling    | Many concurrent connections               | PgBouncer sidecar or Cloud SQL Auth Proxy pooling |
-| Table Partitioning    | `click_events` table grows past 1B rows   | Partition by `clicked_at` month using range parts |
-| Sharding              | Single database can't handle write volume | Shard by `short_code` hash across multiple DBs    |
+| Strategy           | When to Use                               | How                                               |
+| ------------------ | ----------------------------------------- | ------------------------------------------------- |
+| Read Replicas      | Read-heavy workload (100:1 read/write)    | Cloud SQL read replicas + SQLAlchemy `bind` param |
+| Connection Pooling | Many concurrent connections               | PgBouncer sidecar or Cloud SQL Auth Proxy pooling |
+| Table Partitioning | `click_events` table grows past 1B rows   | Partition by `clicked_at` month using range parts |
+| Sharding           | Single database can't handle write volume | Shard by `short_code` hash across multiple DBs    |
 
 ### Cache Scaling
 
-| Strategy              | When to Use                               | How                                              |
-| --------------------- | ----------------------------------------- | ------------------------------------------------ |
-| Redis Cluster         | Dataset exceeds single-node memory        | Memorystore cluster mode (auto-shards data)      |
-| Cache Warming         | Predictable traffic patterns              | Pre-load popular URLs at startup                 |
-| Multi-tier Cache      | Reduce Redis load further                 | Local in-memory cache (LRU) → Redis → PostgreSQL |
-| Write-behind Counter  | Counter writes slow down redirects        | Batch-flush click counts from Redis to DB        |
+| Strategy             | When to Use                        | How                                              |
+| -------------------- | ---------------------------------- | ------------------------------------------------ |
+| Redis Cluster        | Dataset exceeds single-node memory | Memorystore cluster mode (auto-shards data)      |
+| Cache Warming        | Predictable traffic patterns       | Pre-load popular URLs at startup                 |
+| Multi-tier Cache     | Reduce Redis load further          | Local in-memory cache (LRU) → Redis → PostgreSQL |
+| Write-behind Counter | Counter writes slow down redirects | Batch-flush click counts from Redis to DB        |
 
 ### Architecture Improvements for Production
 

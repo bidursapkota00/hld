@@ -16,8 +16,9 @@
 10. [Custom Aliases & Expiration](#custom-aliases--expiration)
 11. [Docker & Docker Compose](#docker--docker-compose)
 12. [Testing](#testing)
-13. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
-14. [Scaling & Production Considerations](#scaling--production-considerations)
+13. [Simulating CDN, Load Balancer & Millions of Users Locally](#simulating-cdn-load-balancer--millions-of-users-locally)
+14. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
+15. [Scaling & Production Considerations](#scaling--production-considerations)
 
 ---
 
@@ -1194,6 +1195,589 @@ pytest -v                                     # Verbose output
 pytest --tb=short                             # Shorter tracebacks
 pytest -k "test_shorten"                      # Run only shorten tests
 ```
+
+---
+
+## Simulating CDN, Load Balancer & Millions of Users Locally
+
+In production, your URL shortener sits behind a CDN and a load balancer, and handles millions of concurrent users. You can simulate all three locally using **Nginx** (as both CDN cache and load balancer), **multiple API replicas** via Docker Compose, and **Locust** for load testing. This setup lets you observe caching behavior, load distribution, and failure modes before deploying to the cloud.
+
+### Architecture Overview
+
+```
+                    ┌──────────────────────────────────────┐
+                    │          Locust (Load Generator)     │
+                    │     Simulates millions of users      │
+                    │     http://localhost:8089 (Web UI)    │
+                    └──────────────┬───────────────────────┘
+                                   │
+                        10,000+ requests/sec
+                                   │
+                    ┌──────────────▼───────────────────────┐
+                    │          Nginx (port 80)             │
+                    │                                      │
+                    │  ┌────────────────────────────────┐  │
+                    │  │  CDN Simulation Layer          │  │
+                    │  │  • proxy_cache for 301s        │  │
+                    │  │  • Cache-Control headers       │  │
+                    │  │  • Cache HIT/MISS via X-Cache  │  │
+                    │  └──────────────┬─────────────────┘  │
+                    │                 │ (cache MISS)        │
+                    │  ┌──────────────▼─────────────────┐  │
+                    │  │  Load Balancer Layer           │  │
+                    │  │  • Round-robin / least_conn    │  │
+                    │  │  • Health checks               │  │
+                    │  │  • X-Upstream-Instance header  │  │
+                    │  └──────────────┬─────────────────┘  │
+                    └─────────────────┼────────────────────┘
+                                      │
+                 ┌────────────────────┼────────────────────┐
+                 │                    │                    │
+          ┌──────▼──────┐     ┌──────▼──────┐     ┌──────▼──────┐
+          │   API - 1   │     │   API - 2   │     │   API - 3   │
+          │  :8000      │     │  :8000      │     │  :8000      │
+          └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+                 │                    │                    │
+                 └────────────────────┼────────────────────┘
+                                      │
+                        ┌─────────────┼──────────────┐
+                        │                            │
+                 ┌──────▼──────┐              ┌──────▼──────┐
+                 │   Redis     │              │ PostgreSQL  │
+                 │   :6379     │              │   :5432     │
+                 └─────────────┘              └─────────────┘
+```
+
+### Nginx Configuration
+
+Create `nginx/nginx.conf` to act as both a CDN cache and a load balancer:
+
+```nginx
+# nginx/nginx.conf
+
+# ── Upstream: defines the pool of API servers for load balancing ──
+upstream url_shortener_api {
+    # least_conn sends new requests to the server with the fewest
+    # active connections. Better than round-robin when requests
+    # have varying processing times.
+    least_conn;
+
+    server api-1:8000;
+    server api-2:8000;
+    server api-3:8000;
+}
+
+# ── CDN Cache: stores responses on disk to avoid hitting the API ──
+proxy_cache_path /var/cache/nginx/cdn
+    levels=1:2                   # Two-level directory hash (e.g., /a/1b/...)
+    keys_zone=cdn_cache:10m      # 10 MB shared memory for cache keys (~80k keys)
+    max_size=1g                  # Max 1 GB of cached responses on disk
+    inactive=60m                 # Evict entries not accessed for 60 minutes
+    use_temp_path=off;           # Write directly to cache dir (avoids copy)
+
+server {
+    listen 80;
+    server_name localhost;
+
+    # ── Logging: track cache behavior ──
+    log_format cdn_log '$remote_addr - $request - '
+                       'Cache:$upstream_cache_status - '
+                       'Upstream:$upstream_addr - '
+                       'Response:$status - ${request_time}s';
+    access_log /var/log/nginx/access.log cdn_log;
+
+    # ── Health check endpoint (not cached) ──
+    location /health {
+        proxy_pass http://url_shortener_api;
+        proxy_cache off;
+    }
+
+    # ── POST /shorten (never cached, needs load balancing only) ──
+    location /shorten {
+        proxy_pass http://url_shortener_api;
+        proxy_cache off;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Tell the client which backend served the request
+        add_header X-Upstream-Instance $upstream_addr always;
+    }
+
+    # ── GET /{short_code} (cached like a CDN) ──
+    location / {
+        proxy_pass http://url_shortener_api;
+
+        # CDN cache settings
+        proxy_cache cdn_cache;
+        proxy_cache_valid 301 302 10m;       # Cache redirects for 10 minutes
+        proxy_cache_valid 404 1m;            # Cache 404s briefly to prevent hammering
+        proxy_cache_valid any 0;             # Don't cache other status codes
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503;
+
+        # Expose cache status to the client (HIT, MISS, EXPIRED, STALE)
+        add_header X-Cache-Status $upstream_cache_status always;
+        add_header X-Upstream-Instance $upstream_addr always;
+
+        # Forward real client IP to the API
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── Analytics endpoints (not cached) ──
+    location /api/analytics {
+        proxy_pass http://url_shortener_api;
+        proxy_cache off;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # ── Cache status page (for debugging) ──
+    location /nginx-status {
+        stub_status on;
+        allow 127.0.0.1;
+        allow 172.0.0.0/8;                  # Docker network
+        deny all;
+    }
+}
+```
+
+`proxy_cache_path` creates an on-disk cache that mimics what a CDN does at edge locations. `levels=1:2` creates a two-level directory hierarchy to avoid putting too many files in a single directory. `keys_zone=cdn_cache:10m` allocates 10 MB of shared memory for storing cache keys and metadata (the actual cached responses are on disk). `proxy_cache_valid 301 302 10m` caches redirect responses for 10 minutes, the same way a real CDN like Cloudflare or Cloud CDN would cache `301` responses. `proxy_cache_use_stale` serves stale cached content if the upstream is down, providing resilience similar to CDN origin shielding. `$upstream_cache_status` returns `HIT`, `MISS`, `EXPIRED`, or `STALE`, letting you verify caching is working. `least_conn` distributes requests to the backend with the fewest active connections, which handles uneven response times better than simple round-robin.
+
+### Updated Docker Compose with CDN & Load Balancer
+
+Replace the original `compose.yaml` with this extended version that runs multiple API replicas behind Nginx:
+
+```yaml
+# compose.prod-sim.yaml
+
+services:
+  # ── Nginx: CDN + Load Balancer ──
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"                              # Public entry point
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - nginx-cache:/var/cache/nginx/cdn
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+      api-3:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── API Replicas (simulates Cloud Run instances) ──
+  api-1:
+    build: .
+    environment: &api-env
+      DATABASE_URL: postgresql://user:pass@db:5432/urlshortener
+      REDIS_URL: redis://cache:6379/0
+      BASE_URL: http://localhost
+      INSTANCE_ID: api-1
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  api-2:
+    build: .
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-2
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  api-3:
+    build: .
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-3
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Database ──
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis Cache ──
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Locust: Load Testing (simulates millions of users) ──
+  locust:
+    build:
+      context: ./loadtest
+      dockerfile: Dockerfile
+    ports:
+      - "8089:8089"                          # Locust web UI
+    environment:
+      - LOCUST_HOST=http://nginx
+      - LOCUST_USERS=10000                   # Simulated concurrent users
+      - LOCUST_SPAWN_RATE=500                # Users spawned per second
+    depends_on:
+      - nginx
+    volumes:
+      - ./loadtest:/mnt/locust
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  redis-data:
+  nginx-cache:
+```
+
+The YAML anchor `&api-env` and merge key `<<: *api-env` avoid duplicating environment variables across replicas. `INSTANCE_ID` lets each replica identify itself in logs and responses. `--maxmemory 256mb --maxmemory-policy allkeys-lru` configures Redis to cap memory at 256 MB and evict least-recently-used keys when full, simulating production memory pressure. `nginx-cache` volume persists the CDN cache across container restarts. Each API replica has its own health check so Nginx only routes to healthy instances.
+
+### Locust Load Test Configuration
+
+Locust simulates user behavior at scale. Create the load test files:
+
+#### `loadtest/Dockerfile`
+
+```dockerfile
+FROM locustio/locust:2.31.5
+
+COPY locustfile.py /mnt/locust/locustfile.py
+```
+
+#### `loadtest/locustfile.py`
+
+```python
+"""
+Load test simulating millions of users hitting the URL shortener.
+Mimics real-world traffic: 95% redirects (reads), 5% shortens (writes).
+
+Run via Docker Compose or standalone:
+    locust -f locustfile.py --host=http://localhost
+"""
+
+import random
+import string
+
+from locust import HttpUser, task, between, events
+from locust.runners import MasterRunner
+
+
+# ── Shared state: pool of short codes created during the test ──
+created_codes: list[str] = []
+
+
+class URLShortenerUser(HttpUser):
+    """Simulates a single user interacting with the URL shortener."""
+
+    # Wait 0.1–1 second between tasks (simulates think time)
+    wait_time = between(0.1, 1)
+
+    # Prebuilt list of URLs to shorten (avoids generating on every request)
+    SAMPLE_URLS = [
+        f"https://www.example.com/article/{i}" for i in range(10000)
+    ]
+
+    def on_start(self):
+        """Called when a simulated user starts. Create an initial short URL."""
+        self._create_short_url()
+
+    @task(95)
+    def redirect_to_url(self):
+        """
+        Simulate a redirect (read). Weighted 95 — this runs 95x more often
+        than the shorten task, matching the 100:1 read/write ratio.
+        """
+        if not created_codes:
+            self._create_short_url()
+            return
+
+        code = random.choice(created_codes)
+        with self.client.get(
+            f"/{code}",
+            allow_redirects=False,         # Don't follow the 301
+            name="GET /{short_code}",      # Group all redirects under one name
+            catch_response=True,
+        ) as response:
+            if response.status_code in (301, 302):
+                response.success()
+            elif response.status_code == 429:
+                response.failure("Rate limited")
+            else:
+                response.failure(f"Unexpected status: {response.status_code}")
+
+    @task(5)
+    def shorten_url(self):
+        """Simulate creating a new short URL (write). Weighted 5."""
+        self._create_short_url()
+
+    def _create_short_url(self):
+        """Helper to create a short URL and store the code."""
+        url = random.choice(self.SAMPLE_URLS)
+        with self.client.post(
+            "/shorten",
+            json={"url": url},
+            name="POST /shorten",
+            catch_response=True,
+        ) as response:
+            if response.status_code == 201:
+                data = response.json()
+                created_codes.append(data["short_code"])
+                # Cap the pool to avoid unbounded memory growth
+                if len(created_codes) > 100000:
+                    created_codes.pop(0)
+                response.success()
+            elif response.status_code == 429:
+                response.failure("Rate limited")
+            else:
+                response.failure(f"Status: {response.status_code}")
+
+
+class HighVolumeUser(HttpUser):
+    """
+    Aggressive user that only does redirects with no think time.
+    Simulates CDN cache warming and bot traffic.
+    """
+
+    wait_time = between(0.01, 0.05)
+    weight = 1                                # 1 HighVolumeUser per 10 normal users
+
+    @task
+    def rapid_redirect(self):
+        """Hit the same popular URLs repeatedly to test CDN caching."""
+        if not created_codes:
+            return
+
+        # Pick from the top 10 "hottest" URLs (simulates Zipf distribution)
+        hot_codes = created_codes[:10] if len(created_codes) >= 10 else created_codes
+        code = random.choice(hot_codes)
+
+        with self.client.get(
+            f"/{code}",
+            allow_redirects=False,
+            name="GET /{short_code} [hot]",
+            catch_response=True,
+        ) as response:
+            if response.status_code in (301, 302):
+                response.success()
+            elif response.status_code == 429:
+                response.failure("Rate limited")
+
+
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    """Seed some URLs before the load test begins."""
+    if isinstance(environment.runner, MasterRunner):
+        return  # Only seed on workers, not the master
+
+    print("Seeding initial URLs for load test...")
+    import requests
+
+    host = environment.host
+    for i in range(100):
+        try:
+            requests.post(
+                f"{host}/shorten",
+                json={"url": f"https://www.example.com/seed/{i}"},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    print(f"Seeded URLs. Pool size: {len(created_codes)}")
+```
+
+`@task(95)` and `@task(5)` create a 95:5 ratio between reads and writes, closely matching the estimated 100:1 read/write ratio. `between(0.1, 1)` adds random think time between requests to simulate real user behavior rather than hammering the server unrealistically. `name="GET /{short_code}"` groups all redirect requests under a single metric name instead of creating separate entries for each short code. `catch_response=True` lets you manually mark responses as success or failure based on custom logic. `HighVolumeUser` with `weight=1` spawns fewer instances but with minimal wait time, simulating bot traffic or CDN cache-warming behavior. The `on_test_start` event seeds 100 URLs before the test begins so redirect requests have codes to work with immediately.
+
+### Running the Simulation
+
+#### Start Everything
+
+```bash
+# Build and launch all services
+docker compose -f compose.prod-sim.yaml up --build -d
+
+# Watch logs from all services
+docker compose -f compose.prod-sim.yaml logs -f
+
+# Watch only Nginx access logs (see cache HIT/MISS)
+docker compose -f compose.prod-sim.yaml logs -f nginx
+```
+
+#### Open the Locust Web UI
+
+Navigate to `http://localhost:8089` in your browser. Configure the test:
+
+| Setting          | Value                | Purpose                                      |
+| ---------------- | -------------------- | -------------------------------------------- |
+| Number of users  | 10,000               | Simulates 10k concurrent users               |
+| Spawn rate       | 500                  | Ramp up 500 users per second                 |
+| Host             | http://nginx         | Target the Nginx CDN/LB (auto-filled)        |
+
+Click **Start swarming** to begin. Locust shows real-time charts for:
+- **Requests per second** — aim for 10,000+ RPS
+- **Response time** (median, p95, p99) — cache HITs should be < 5 ms
+- **Failure rate** — watch for 429 (rate limiting) or 5xx errors
+
+#### Verify CDN Caching
+
+```bash
+# First request → cache MISS (hits the API)
+curl -I http://localhost/abc1234
+# X-Cache-Status: MISS
+# X-Upstream-Instance: 172.18.0.5:8000
+
+# Second request → cache HIT (served from Nginx cache)
+curl -I http://localhost/abc1234
+# X-Cache-Status: HIT
+# X-Upstream-Instance: (empty — no upstream contacted)
+```
+
+#### Verify Load Balancing
+
+```bash
+# Multiple requests should hit different backends
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w "Instance: %header{X-Upstream-Instance}\n" \
+    -X POST http://localhost/shorten \
+    -H "Content-Type: application/json" \
+    -d "{\"url\": \"https://example.com/$i\"}"
+done
+
+# Output (with least_conn):
+# Instance: 172.18.0.3:8000
+# Instance: 172.18.0.4:8000
+# Instance: 172.18.0.5:8000
+# Instance: 172.18.0.3:8000
+# Instance: 172.18.0.5:8000
+# Instance: 172.18.0.4:8000
+```
+
+#### Simulate Server Failure
+
+```bash
+# Kill one API replica
+docker compose -f compose.prod-sim.yaml stop api-2
+
+# Nginx automatically stops sending traffic to api-2
+# Existing cached redirects still serve from CDN cache (X-Cache-Status: HIT)
+
+# Bring it back
+docker compose -f compose.prod-sim.yaml start api-2
+```
+
+### Scaling to Millions of Users
+
+A single machine can't truly open millions of TCP connections, but Locust can approximate it:
+
+```bash
+# Run Locust in distributed mode for higher throughput
+docker compose -f compose.prod-sim.yaml up --build --scale locust-worker=4 -d
+```
+
+For distributed Locust, add worker services to `compose.prod-sim.yaml`:
+
+```yaml
+  locust-master:
+    build:
+      context: ./loadtest
+    ports:
+      - "8089:8089"
+    command: >
+      locust -f /mnt/locust/locustfile.py
+      --master
+      --expect-workers=4
+    environment:
+      - LOCUST_HOST=http://nginx
+    volumes:
+      - ./loadtest:/mnt/locust
+    depends_on:
+      - nginx
+
+  locust-worker:
+    build:
+      context: ./loadtest
+    command: >
+      locust -f /mnt/locust/locustfile.py
+      --worker
+      --master-host=locust-master
+    environment:
+      - LOCUST_HOST=http://nginx
+    volumes:
+      - ./loadtest:/mnt/locust
+    depends_on:
+      - locust-master
+    deploy:
+      replicas: 4                            # 4 workers, each handles ~2500 users
+```
+
+Each Locust worker runs in its own process and can generate ~2,500 concurrent users. With 4 workers, you simulate 10,000 users generating 15,000–30,000 requests/sec depending on response times. To simulate millions of users, run Locust workers across multiple machines or use Locust's `--headless` mode with `--users=1000000` and `--spawn-rate=10000`.
+
+### What to Observe
+
+| Metric               | Where to Check                        | What It Tells You                                               |
+| -------------------- | ------------------------------------- | --------------------------------------------------------------- |
+| Cache hit ratio      | Nginx logs (`X-Cache-Status`)         | How effective the CDN cache is (aim for > 80% HITs)             |
+| RPS per instance     | Locust dashboard                      | Whether load is evenly distributed across API replicas          |
+| p99 latency          | Locust dashboard                      | Tail latency — cache MISSes should be < 50 ms                  |
+| Redis memory         | `docker exec cache redis-cli INFO memory` | Whether the LRU eviction policy is working under pressure  |
+| PostgreSQL connections | `docker exec db psql -c 'SELECT count(*) FROM pg_stat_activity'` | Connection pool pressure across replicas |
+| Error rate           | Locust failures tab                   | 429s indicate rate limiter kicking in; 5xx means backend issues |
+| Nginx active connections | `curl http://localhost/nginx-status` | How many concurrent connections Nginx is handling              |
+
+This local simulation gives you confidence that the architecture handles production-like traffic patterns, that the CDN cache dramatically reduces backend load, and that the load balancer distributes traffic evenly across healthy replicas, all before spending a dollar on cloud infrastructure.
 
 ---
 

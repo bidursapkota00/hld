@@ -1199,16 +1199,383 @@ pytest -k "test_shorten"                      # Run only shorten tests
 
 ## Load Balancing with Autoscaling on Kubernetes
 
-...
+Kubernetes orchestrates your containers across multiple nodes, automatically distributing traffic and scaling replicas based on demand. This section sets up a local cluster with Minikube, deploys PostgreSQL and Redis as StatefulSets, runs the API as a Deployment behind a Service, and configures a Horizontal Pod Autoscaler (HPA) to scale based on CPU utilization.
 
-#### Prerequisites
+### Prerequisites
 
 ```bash
 # Install Minikube and kubectl
 brew install minikube kubectl
 
-# ...
+# Start a local cluster
+minikube start --cpus=4 --memory=4096
+
+# Enable the metrics-server addon (required for HPA)
+minikube addons enable metrics-server
+
+# Enable the ingress addon (optional, for local domain routing)
+minikube addons enable ingress
+
+# Verify the cluster is running
+kubectl cluster-info
+kubectl get nodes
 ```
+
+`minikube start` creates a single-node Kubernetes cluster inside a VM or container on your machine. `metrics-server` collects CPU and memory usage from each pod, which the HPA reads to decide when to scale. Without it, `kubectl top pods` and autoscaling won't work.
+
+### Namespace
+
+```bash
+kubectl create namespace url-shortener
+```
+
+Namespaces isolate resources logically within a cluster. All manifests below use `namespace: url-shortener` so the entire application can be managed or torn down as a unit with `kubectl delete namespace url-shortener`.
+
+### ConfigMap & Secrets
+
+```yaml
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: url-shortener
+data:
+  BASE_URL: "http://localhost:8000"
+  SHORT_CODE_LENGTH: "7"
+  DEFAULT_TTL_DAYS: "365"
+  RATE_LIMIT_PER_MINUTE: "60"
+```
+
+```yaml
+# k8s/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: url-shortener
+type: Opaque
+stringData:
+  POSTGRES_USER: user
+  POSTGRES_PASSWORD: pass
+  POSTGRES_DB: urlshortener
+  DATABASE_URL: "postgresql://user:pass@postgres:5432/urlshortener"
+  REDIS_URL: "redis://redis:6379/0"
+```
+
+```bash
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secret.yaml
+```
+
+ConfigMaps hold non-sensitive configuration; Secrets hold credentials. Both are injected into pods as environment variables. In production, use an external secret manager (GCP Secret Manager, HashiCorp Vault) and reference secrets via the `ExternalSecret` CRD instead of storing them in YAML files.
+
+### PostgreSQL StatefulSet
+
+```yaml
+# k8s/postgres.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: url-shortener
+spec:
+  clusterIP: None                              # Headless service for stable DNS
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: url-shortener
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: db-secret
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "user", "-d", "urlshortener"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+```
+
+A StatefulSet (not a Deployment) is used because databases need stable network identities and persistent storage. The headless Service (`clusterIP: None`) gives each pod a stable DNS name (`postgres-0.postgres.url-shortener.svc.cluster.local`). `volumeClaimTemplates` creates a PersistentVolumeClaim for each replica, so data survives pod restarts. The `readinessProbe` uses `pg_isready` — the same utility from the Docker Compose health check — to ensure traffic is only routed to the pod after PostgreSQL is ready.
+
+### Redis StatefulSet
+
+```yaml
+# k8s/redis.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: url-shortener
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: url-shortener
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server", "--appendonly", "yes"]
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 500Mi
+```
+
+Same pattern as PostgreSQL: a headless Service for stable DNS and a PersistentVolumeClaim for AOF persistence. The `redis-cli ping` readiness probe mirrors the Docker Compose health check.
+
+### API Deployment
+
+```yaml
+# k8s/api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: url-shortener
+spec:
+  replicas: 2                                  # Start with 2 replicas
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: url-shortener:latest
+          imagePullPolicy: IfNotPresent         # Use local Minikube image
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: db-secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+```
+
+Unlike the databases, the API is stateless and uses a **Deployment**, which supports rolling updates and horizontal scaling. The `readinessProbe` checks `/health` before routing traffic to a new pod — this prevents sending requests to pods that haven't connected to PostgreSQL or Redis yet. The `livenessProbe` restarts a pod if it becomes unresponsive (3 consecutive failures). `imagePullPolicy: IfNotPresent` tells Kubernetes to use the image from Minikube's local Docker daemon instead of pulling from a remote registry.
+
+### API Service
+
+```yaml
+# k8s/api-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: url-shortener
+spec:
+  type: LoadBalancer                           # NodePort on Minikube
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP
+```
+
+The Service is the stable network endpoint for the API pods. `type: LoadBalancer` provisions an external IP on cloud providers; on Minikube, it falls back to a NodePort. The Service distributes traffic across all pods matching `app: api` using round-robin by default. Kubernetes automatically updates the endpoint list as pods scale up/down or restart.
+
+### Horizontal Pod Autoscaler (HPA)
+
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: url-shortener
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30           # React quickly to spikes
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60                    # Add up to 2 pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300          # Wait 5 min before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60                    # Remove 1 pod per minute
+```
+
+The HPA watches the metrics-server and adjusts the number of API replicas. When average CPU across all pods exceeds 60%, it adds pods (up to 10). When load drops, it removes pods (down to 2). The `behavior` section prevents flapping: scale-up has a short 30-second window to react quickly to traffic spikes, while scale-down waits 5 minutes to avoid premature removal during intermittent load dips.
+
+### Build & Deploy
+
+```bash
+# Point your shell to Minikube's Docker daemon (so builds are available to the cluster)
+eval $(minikube docker-env)
+
+# Build the image inside Minikube's Docker
+docker build -t url-shortener:latest .
+
+# Apply all manifests
+kubectl apply -f k8s/
+
+# Verify everything is running
+kubectl get all -n url-shortener
+```
+
+`eval $(minikube docker-env)` redirects `docker build` to Minikube's internal Docker daemon. This avoids pushing images to a registry — Kubernetes pods can pull `url-shortener:latest` directly from the local daemon.
+
+### Access the API
+
+```bash
+# Get the external URL (Minikube tunnels LoadBalancer services)
+minikube service api -n url-shortener --url
+
+# Or use port-forwarding for quick local access
+kubectl port-forward svc/api 8000:80 -n url-shortener
+```
+
+`minikube service` creates a tunnel and prints the accessible URL. `port-forward` maps `localhost:8000` directly to the Service, useful for development without exposing a node port.
+
+### Monitor Autoscaling
+
+```bash
+# Watch HPA status (shows current/target CPU and replica count)
+kubectl get hpa -n url-shortener --watch
+
+# View pod CPU and memory usage
+kubectl top pods -n url-shortener
+
+# Check pod events and scaling decisions
+kubectl describe hpa api-hpa -n url-shortener
+```
+
+### Load Test to Trigger Autoscaling
+
+```bash
+# Install hey (HTTP load generator)
+brew install hey
+
+# Send 1000 requests with 50 concurrent workers
+hey -n 1000 -c 50 http://$(minikube service api -n url-shortener --url | head -1)/health
+
+# Watch pods scale up in another terminal
+kubectl get pods -n url-shortener --watch
+```
+
+Under load, you'll see the HPA increase the replica count as CPU crosses the 60% threshold. After the load stops, pods scale back down after the 5-minute stabilization window.
 
 ---
 

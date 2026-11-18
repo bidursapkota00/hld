@@ -1718,6 +1718,582 @@ docker compose -f compose.prod-sim.yaml stop api-2
 docker compose -f compose.prod-sim.yaml start api-2
 ```
 
+### Local Autoscaling with Kubernetes (Minikube + HPA)
+
+Docker Compose scales containers manually. To simulate **real autoscaling** — where replicas increase under load and shrink when idle — run the stack on Kubernetes locally with Minikube and the Horizontal Pod Autoscaler (HPA). This is exactly what production Kubernetes clusters and managed services like GKE Autopilot do.
+
+#### Architecture on Kubernetes
+
+```
+                    ┌──────────────────────────────────────────┐
+                    │          Locust (Load Generator)         │
+                    │     kubectl port-forward :8089           │
+                    └──────────────┬───────────────────────────┘
+                                   │
+                    ┌──────────────▼───────────────────────────┐
+                    │     Nginx Ingress Controller             │
+                    │     (CDN cache + load balancer)          │
+                    │     http://url-shortener.local           │
+                    └──────────────┬───────────────────────────┘
+                                   │
+                    ┌──────────────▼───────────────────────────┐
+                    │     Kubernetes Service (ClusterIP)       │
+                    │     Distributes to healthy pods          │
+                    └──────────────┬───────────────────────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              │                    │                    │
+       ┌──────▼──────┐     ┌──────▼──────┐     ┌──────▼──────┐
+       │   Pod: API  │     │   Pod: API  │     │   Pod: API  │
+       │  (auto)     │     │  (auto)     │     │  (auto)     │
+       └─────────────┘     └─────────────┘     └─────────────┘
+              ↕ HPA scales pods 1 ↔ 10 based on CPU / RPS
+                                   │
+                    ┌──────────────▼───────────────────────────┐
+                    │     Metrics Server                       │
+                    │     Feeds CPU/memory to HPA              │
+                    └──────────────────────────────────────────┘
+                                   │
+                 ┌─────────────────┼──────────────┐
+                 │                                │
+          ┌──────▼──────┐                  ┌──────▼──────┐
+          │   Redis     │                  │ PostgreSQL  │
+          │  (StatefulSet)                 │ (StatefulSet)│
+          └─────────────┘                  └─────────────┘
+```
+
+#### Prerequisites
+
+```bash
+# Install Minikube and kubectl
+brew install minikube kubectl
+
+# Start a local cluster with enough resources
+minikube start \
+  --cpus=4 \
+  --memory=8192 \
+  --driver=docker
+
+# Enable required addons
+minikube addons enable metrics-server          # Required for HPA (CPU/memory metrics)
+minikube addons enable ingress                 # Nginx Ingress Controller
+
+# Verify metrics-server is running (wait ~60s after enabling)
+kubectl top nodes
+```
+
+`metrics-server` collects CPU and memory usage from every pod via the kubelet. Without it, HPA has no metrics to act on. `ingress` installs the Nginx Ingress Controller, which acts as both the CDN cache and load balancer, replacing the standalone Nginx container from the Docker Compose setup.
+
+#### Build the Docker Image Inside Minikube
+
+```bash
+# Point your shell's Docker client at Minikube's Docker daemon
+eval $(minikube docker-env)
+
+# Build the image (now available inside the cluster, no registry needed)
+docker build -t url-shortener:latest .
+
+# Verify
+docker images | grep url-shortener
+```
+
+`minikube docker-env` avoids pushing to a remote registry. The image is built directly inside Minikube's VM, so Kubernetes can pull it with `imagePullPolicy: Never`.
+
+#### Kubernetes Manifests
+
+Create a `k8s/` directory with all manifests:
+
+##### `k8s/namespace.yaml`
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: url-shortener
+```
+
+##### `k8s/postgres.yaml`
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: url-shortener
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: url-shortener
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "user"
+            - name: POSTGRES_PASSWORD
+              value: "pass"
+            - name: POSTGRES_DB
+              value: "urlshortener"
+          volumeMounts:
+            - name: pg-data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "user", "-d", "urlshortener"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: pg-data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: url-shortener
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None                              # Headless service for StatefulSet
+```
+
+##### `k8s/redis.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: url-shortener
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb",
+                    "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: url-shortener
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+  clusterIP: None
+```
+
+##### `k8s/api.yaml` — The API Deployment with Resource Limits
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: url-shortener
+  labels:
+    app: api
+spec:
+  replicas: 2                                  # HPA will override this
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: url-shortener:latest
+          imagePullPolicy: Never               # Use the locally built image
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://user:pass@postgres:5432/urlshortener"
+            - name: REDIS_URL
+              value: "redis://redis:6379/0"
+            - name: BASE_URL
+              value: "http://url-shortener.local"
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name     # Pod name as instance ID
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m                        # 0.2 CPU cores reserved
+              memory: 128Mi
+            limits:
+              cpu: 500m                        # 0.5 CPU cores max
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: url-shortener
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: ClusterIP
+```
+
+`resources.requests` is what HPA uses to calculate CPU percentage. If a pod requests `200m` (0.2 cores) and uses `160m`, HPA sees it as 80% CPU utilization. `resources.limits` caps the maximum to prevent a single pod from starving others. `readinessProbe` ensures Kubernetes only routes traffic to pods that are ready, so during scale-up new pods don't receive requests until they pass the health check. `metadata.name` via `fieldRef` injects the pod name (e.g., `api-7d4b8c6f9-x2k4p`) as the instance ID, so you can trace which pod handled each request.
+
+##### `k8s/hpa.yaml` — Horizontal Pod Autoscaler
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: url-shortener
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    # Scale based on average CPU utilization across all pods
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50               # Target 50% CPU per pod
+    # Scale based on average memory utilization
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70               # Target 70% memory per pod
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30           # Wait 30s before scaling up again
+      policies:
+        - type: Pods
+          value: 2                             # Add up to 2 pods at a time
+          periodSeconds: 30
+        - type: Percent
+          value: 50                            # Or add up to 50% more pods
+          periodSeconds: 30
+      selectPolicy: Max                        # Use whichever policy adds more pods
+    scaleDown:
+      stabilizationWindowSeconds: 120          # Wait 2 min before scaling down
+      policies:
+        - type: Pods
+          value: 1                             # Remove 1 pod at a time
+          periodSeconds: 60
+      selectPolicy: Min                        # Conservative: remove fewer pods
+```
+
+`autoscaling/v2` supports multiple metrics and fine-grained scaling behavior. `averageUtilization: 50` means HPA targets 50% CPU across all pods. If average CPU is 80% with 2 pods, HPA calculates: `desired = ceil(2 × (80/50)) = 4 pods`. The `behavior` section prevents thrashing: `scaleUp.stabilizationWindowSeconds: 30` waits 30 seconds before scaling up again, while `scaleDown.stabilizationWindowSeconds: 120` waits 2 full minutes before removing pods. `selectPolicy: Max` for scale-up means HPA picks the policy that adds the most pods (aggressive scaling up), while `selectPolicy: Min` for scale-down picks the policy that removes the fewest pods (conservative scaling down). This asymmetry is intentional — it's better to have extra capacity than to drop requests.
+
+##### `k8s/ingress.yaml` — Nginx Ingress with CDN Caching
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: url-shortener
+  annotations:
+    # CDN-like caching at the ingress layer
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/server-snippet: |
+      proxy_cache_path /tmp/nginx-cache levels=1:2 keys_zone=cdn:10m
+                       max_size=256m inactive=30m use_temp_path=off;
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_cache cdn;
+      proxy_cache_valid 301 302 10m;
+      proxy_cache_valid 404 1m;
+      proxy_cache_key "$scheme$request_method$host$request_uri";
+      proxy_cache_use_stale error timeout updating http_500 http_502 http_503;
+      add_header X-Cache-Status $upstream_cache_status always;
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "10"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: url-shortener.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+The Ingress annotations configure the Nginx Ingress Controller to cache `301`/`302` redirects for 10 minutes, identical to how Cloud CDN or Cloudflare would cache at edge nodes. `proxy_cache_use_stale` serves stale content when the API is unavailable, providing resilience during scale-up events when new pods are starting. `X-Cache-Status` exposes HIT/MISS so you can verify caching from curl.
+
+#### Deploy Everything
+
+```bash
+# Apply all manifests
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/postgres.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/api.yaml
+kubectl apply -f k8s/hpa.yaml
+kubectl apply -f k8s/ingress.yaml
+
+# Wait for all pods to be ready
+kubectl -n url-shortener wait --for=condition=ready pod --all --timeout=120s
+
+# Add the hostname to /etc/hosts
+echo "$(minikube ip) url-shortener.local" | sudo tee -a /etc/hosts
+
+# Verify everything is running
+kubectl -n url-shortener get pods,svc,hpa
+```
+
+Expected output:
+
+```
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/api-7d4b8c6f9-k2x4p   1/1     Running   0          45s
+pod/api-7d4b8c6f9-m8n3q   1/1     Running   0          45s
+pod/postgres-0             1/1     Running   0          60s
+pod/redis-0                1/1     Running   0          55s
+
+NAME               TYPE        CLUSTER-IP      PORT(S)
+service/api        ClusterIP   10.96.45.123    80/TCP
+service/postgres   ClusterIP   None            5432/TCP
+service/redis      ClusterIP   None            6379/TCP
+
+NAME                      REFERENCE        TARGETS   MINPODS   MAXPODS   REPLICAS
+hpa/api-hpa               Deployment/api   12%/50%   1         10        2
+```
+
+#### Watch Autoscaling in Real Time
+
+Open three terminal windows:
+
+```bash
+# Terminal 1: Watch HPA decisions (updates every 15s)
+kubectl -n url-shortener get hpa --watch
+
+# Output (live-updating):
+# NAME      REFERENCE        TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+# api-hpa   Deployment/api   12%/50%   1         10        2          5m
+# api-hpa   Deployment/api   67%/50%   1         10        2          6m    ← load hits
+# api-hpa   Deployment/api   67%/50%   1         10        3          6m    ← scale up!
+# api-hpa   Deployment/api   78%/50%   1         10        3          7m
+# api-hpa   Deployment/api   78%/50%   1         10        5          7m    ← scale up!
+# api-hpa   Deployment/api   45%/50%   1         10        5          9m    ← stabilized
+# api-hpa   Deployment/api   8%/50%    1         10        5          15m   ← load stops
+# api-hpa   Deployment/api   8%/50%    1         10        3          17m   ← scale down
+# api-hpa   Deployment/api   5%/50%    1         10        3          19m
+# api-hpa   Deployment/api   5%/50%    1         10        1          21m   ← scale to min
+```
+
+```bash
+# Terminal 2: Watch pods being created and terminated
+kubectl -n url-shortener get pods --watch
+
+# Output:
+# api-7d4b8c6f9-k2x4p   1/1   Running   0   5m
+# api-7d4b8c6f9-m8n3q   1/1   Running   0   5m
+# api-7d4b8c6f9-r9t2w   0/1   Pending   0   0s     ← HPA triggered scale-up
+# api-7d4b8c6f9-r9t2w   0/1   ContainerCreating   0   1s
+# api-7d4b8c6f9-r9t2w   1/1   Running   0   3s     ← ready, receiving traffic
+# api-7d4b8c6f9-j5v8x   0/1   Pending   0   0s     ← another scale-up
+# api-7d4b8c6f9-j5v8x   1/1   Running   0   4s
+#   ... load stops ...
+# api-7d4b8c6f9-j5v8x   1/1   Terminating   0   12m  ← scale-down
+# api-7d4b8c6f9-r9t2w   1/1   Terminating   0   12m
+```
+
+```bash
+# Terminal 3: Watch resource usage per pod
+kubectl -n url-shortener top pods --containers
+
+# Output:
+# POD                    NAME   CPU(cores)   MEMORY(bytes)
+# api-7d4b8c6f9-k2x4p   api    156m         98Mi
+# api-7d4b8c6f9-m8n3q   api    148m         95Mi
+# api-7d4b8c6f9-r9t2w   api    132m         87Mi
+# postgres-0             pg     45m          120Mi
+# redis-0                redis  12m          28Mi
+```
+
+#### Generate Load to Trigger Autoscaling
+
+You can use the same Locust setup or a quick one-liner to trigger scaling:
+
+```bash
+# Option 1: Use Locust (deploy to the cluster)
+kubectl -n url-shortener run locust \
+  --image=locustio/locust:2.31.5 \
+  --restart=Never \
+  --command -- \
+  locust -f /dev/null \
+  --headless \
+  --host=http://api \
+  --users=2000 \
+  --spawn-rate=100 \
+  --run-time=5m \
+  --only-summary
+
+# Option 2: Simple stress test with hey (HTTP load generator)
+# Install: brew install hey
+hey -z 3m -c 200 -q 50 http://url-shortener.local/health
+
+# Option 3: Use kubectl to generate traffic from inside the cluster
+kubectl -n url-shortener run loadgen --rm -it --image=busybox -- sh -c \
+  'while true; do wget -q -O- http://api/health > /dev/null 2>&1; done'
+```
+
+```bash
+# Watch the autoscaler react
+kubectl -n url-shortener describe hpa api-hpa
+
+# Output (Events section):
+# Events:
+#   Type    Reason             Message
+#   ----    ------             -------
+#   Normal  SuccessfulRescale  New size: 3; reason: cpu resource utilization
+#                              (percentage of request) above target
+#   Normal  SuccessfulRescale  New size: 5; reason: cpu resource utilization
+#                              (percentage of request) above target
+#   Normal  SuccessfulRescale  New size: 3; reason: All metrics below target
+#   Normal  SuccessfulRescale  New size: 1; reason: All metrics below target
+```
+
+`describe hpa` shows the full event history with timestamps and reasons for each scaling decision. The HPA algorithm calculates desired replicas as: $\text{desired} = \lceil \text{current} \times \frac{\text{currentMetric}}{\text{targetMetric}} \rceil$. So if 2 pods are at 80% CPU with a 50% target: $\lceil 2 \times \frac{80}{50} \rceil = 4$ pods.
+
+#### Full Autoscaling Timeline
+
+```
+Time    Replicas  Avg CPU   Event
+─────   ────────  ───────   ──────────────────────────────────────
+0:00    2         10%       Idle — below target, but already at reasonable min
+0:30    2         12%       No change (above minReplicas)
+
+                            ── Locust starts: 2000 users, 100/sec ramp ──
+
+1:00    2         55%       HPA detects CPU > 50% target
+1:15    3         52%       Scale up: ceil(2 × 55/50) = 3
+1:30    3         72%       Still above target with new load
+1:45    5         48%       Scale up: ceil(3 × 72/50) = 5 (Max policy: +2)
+2:00    5         45%       Stabilized below target ✓
+3:00    5         43%       Holding steady
+
+                            ── Locust stops ──
+
+5:00    5         8%        Load dropped, stabilization window counting
+7:00    3         5%        Scale down after 2min window: remove 1, then 1 more
+9:00    1         3%        Scale down to minReplicas
+```
+
+#### Cleanup
+
+```bash
+# Delete all resources
+kubectl delete namespace url-shortener
+
+# Stop Minikube (preserves state)
+minikube stop
+
+# Or delete the cluster entirely
+minikube delete
+```
+
+#### Why Kubernetes HPA over a Custom Autoscaler
+
+| Aspect               | Custom Script                     | Kubernetes HPA                                 |
+| -------------------- | --------------------------------- | ---------------------------------------------- |
+| Metric collection    | Manual (`docker stats` + parsing) | Automatic (metrics-server built-in)            |
+| Scaling algorithm    | Simple threshold comparison       | Proportional: `ceil(current × actual/target)`  |
+| Stabilization        | Basic cooldown timer              | Separate up/down windows with policy selection |
+| Health-aware routing | Manual Nginx reload               | Automatic via readiness probes + kube-proxy    |
+| Rolling updates      | Not supported                     | Zero-downtime by default                       |
+| Scale to zero        | Needs custom logic                | Supported with KEDA addon                      |
+| Production-ready     | No — demo only                    | Yes — same system running in GKE/EKS/AKS      |
+| Complexity           | ~200 lines of Python              | ~50 lines of YAML                              |
+
+Kubernetes HPA is the industry standard for autoscaling containers. By running it locally on Minikube, you get the exact same behavior as production GKE/EKS clusters. The HPA YAML you write here can be deployed to any Kubernetes cluster without changes.
+
 ### Scaling to Millions of Users
 
 A single machine can't truly open millions of TCP connections, but Locust can approximate it:
@@ -1776,8 +2352,11 @@ Each Locust worker runs in its own process and can generate ~2,500 concurrent us
 | PostgreSQL connections | `docker exec db psql -c 'SELECT count(*) FROM pg_stat_activity'` | Connection pool pressure across replicas |
 | Error rate           | Locust failures tab                   | 429s indicate rate limiter kicking in; 5xx means backend issues |
 | Nginx active connections | `curl http://localhost/nginx-status` | How many concurrent connections Nginx is handling              |
+| HPA scaling events   | `kubectl describe hpa api-hpa`        | When and why replicas were added or removed                     |
+| Pod count over time  | `kubectl get hpa --watch`             | Live view of replica count adjusting to load                    |
+| Per-pod CPU/memory   | `kubectl top pods`                    | Resource usage driving HPA decisions                            |
 
-This local simulation gives you confidence that the architecture handles production-like traffic patterns, that the CDN cache dramatically reduces backend load, and that the load balancer distributes traffic evenly across healthy replicas, all before spending a dollar on cloud infrastructure.
+This local simulation gives you confidence that the architecture handles production-like traffic patterns, that the CDN cache dramatically reduces backend load, that the load balancer distributes traffic evenly across healthy replicas, and that Kubernetes HPA scales pods up under pressure and back down when idle — all before spending a dollar on cloud infrastructure.
 
 ---
 

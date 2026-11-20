@@ -4,29 +4,29 @@
 
 ## Table of Contents
 
-1. [Step 1 — Health Check FastAPI in Docker Compose](#step-1--health-check-fastapi-in-docker-compose)
-2. [Step 2 — Connect to PostgreSQL](#step-2--connect-to-postgresql)
-3. [Step 3 — URL Model + POST API + Tests](#step-3--url-model--post-api--tests)
-4. [Step 4 — Redirect Endpoint + Tests](#step-4--redirect-endpoint--tests)
-5. [Step 5 — Better Algorithms, Custom Aliases & Expiration](#step-5--better-algorithms-custom-aliases--expiration)
-6. [Step 6 — Caching with Redis](#step-6--caching-with-redis)
-7. [Step 7 — Rate Limiting](#step-7--rate-limiting)
-8. [Step 8 — Click Events Model + Analytics](#step-8--click-events-model--analytics)
-9. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
-10. [Testing (Final)](#testing-final)
-11. [Project Setup (Final)](#project-setup-final)
-12. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
-13. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
+1. [Requirements & Estimations](#requirements--estimations)
+2. [High-Level Architecture](#high-level-architecture)
+3. [Health Check FastAPI in Docker Compose](#health-check-fastapi-in-docker-compose)
+4. [Connect to PostgreSQL](#connect-to-postgresql)
+5. [URL Model + POST API + Tests](#url-model--post-api--tests)
+6. [Redirect Endpoint + Tests](#redirect-endpoint--tests)
+7. [Better Algorithms, Custom Aliases & Expiration](#better-algorithms-custom-aliases--expiration)
+8. [Caching with Redis](#caching-with-redis)
+9. [Rate Limiting](#rate-limiting)
+10. [Click Events Model + Analytics](#click-events-model--analytics)
+11. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
+12. [Testing (Final)](#testing-final)
+13. [Project Setup (Final)](#project-setup-final)
+14. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
+15. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
 
 ---
 
-## Step 1 — Health Check FastAPI in Docker Compose
-
-### Requirements & Estimations
+## Requirements & Estimations
 
 Before writing a single line of code, define what the system needs to do and estimate the scale it must handle.
 
-#### Functional Requirements
+### Functional Requirements
 
 | Requirement  | Description                                                      |
 | ------------ | ---------------------------------------------------------------- |
@@ -36,7 +36,7 @@ Before writing a single line of code, define what the system needs to do and est
 | Expiration   | URLs can have a TTL after which they stop working                |
 | Analytics    | Track click count, timestamp, referrer, and geolocation per link |
 
-#### Non-Functional Requirements
+### Non-Functional Requirements
 
 | Requirement  | Target                                                 |
 | ------------ | ------------------------------------------------------ |
@@ -45,7 +45,7 @@ Before writing a single line of code, define what the system needs to do and est
 | Durability   | No shortened link should ever be lost                  |
 | Scalability  | Handle 1 000 shortens/sec, 10 000 redirects/sec        |
 
-#### Back-of-the-Envelope Estimations
+### Back-of-the-Envelope Estimations
 
 ```
 Read : Write ratio          ≈ 100 : 1
@@ -59,7 +59,9 @@ Cache (20% hot URLs)        ≈ 100 M × 0.2 × 500 B ≈ 10 GB (fits in Redis)
 
 A 7-character code using `[a-zA-Z0-9]` gives 62^7 ≈ 3.5 trillion combinations, which is more than enough for the estimated 6 billion total URLs over 5 years. Caching the top 20% of hot URLs in Redis keeps redirect latency under 10 ms.
 
-### High-Level Architecture
+---
+
+## High-Level Architecture
 
 ```
                         ┌──────────────┐
@@ -90,7 +92,9 @@ A 7-character code using `[a-zA-Z0-9]` gives 62^7 ≈ 3.5 trillion combinations,
 
 The client sends a request to the load balancer, which forwards it to one of the FastAPI instances running on Cloud Run. For redirects, the API checks Redis first (cache hit returns in < 10 ms). On a cache miss, it queries PostgreSQL, caches the result, and redirects. For new URLs, the API generates a short code, stores it in PostgreSQL, and writes through to Redis.
 
-### Create the Minimal Project
+---
+
+## Health Check FastAPI in Docker Compose
 
 In this first step we create the bare minimum: a FastAPI app with a single `/health` endpoint, a Dockerfile, and a Docker Compose file with only the `api` service. No database, no Redis.
 
@@ -188,7 +192,7 @@ curl http://localhost:8000/health
 **Expected output:**
 
 ```json
-{"status":"healthy"}
+{ "status": "healthy" }
 ```
 
 Visit `http://localhost:8000/docs` for the interactive API documentation.
@@ -197,7 +201,7 @@ Stop the stack with `Ctrl+C` or `docker compose down`.
 
 ---
 
-## Step 2 — Connect to PostgreSQL
+## Connect to PostgreSQL
 
 We now add a PostgreSQL database, wire it into the FastAPI app, and verify the connection.
 
@@ -379,12 +383,12 @@ curl http://localhost:8000/health
 **Expected output:**
 
 ```json
-{"status":"healthy"}
+{ "status": "healthy" }
 ```
 
 ---
 
-## Step 3 — URL Model + POST API + Tests
+## URL Model + POST API + Tests
 
 We create the initial `URL` model (minimal — no click tracking or expiration yet), Pydantic schemas, the shortening algorithm, and the `POST /shorten` endpoint. We also add the first tests.
 
@@ -718,7 +722,7 @@ tests/test_shorten.py::test_invalid_url_rejected PASSED
 
 ---
 
-## Step 4 — Redirect Endpoint + Tests
+## Redirect Endpoint + Tests
 
 We add the `GET /{short_code}` redirect endpoint (simple version — no cache, no click tracking, no expiration check yet) and its tests.
 
@@ -841,7 +845,7 @@ tests/test_redirect.py::test_redirect_not_found PASSED
 
 ---
 
-## Step 5 — Better Algorithms, Custom Aliases & Expiration
+## Better Algorithms, Custom Aliases & Expiration
 
 We now enhance the system with multiple shortening algorithms, custom alias support, URL expiration, and click counting.
 
@@ -1311,7 +1315,7 @@ tests/test_redirect.py::test_click_count_increments PASSED
 
 ---
 
-## Step 6 — Caching with Redis
+## Caching with Redis
 
 Every redirect triggers a database query. At 10 000 reads/sec, PostgreSQL would buckle. Redis acts as a read-through cache, serving hot URLs from memory in < 1 ms.
 
@@ -1603,7 +1607,7 @@ curl -v http://localhost:8000/<short_code> 2>&1 | head -20
 
 ---
 
-## Step 7 — Rate Limiting
+## Rate Limiting
 
 Without rate limiting, a single client can overwhelm the service with requests. We implement a **sliding window** rate limiter using Redis.
 
@@ -1777,7 +1781,7 @@ curl -v http://localhost:8000/health 2>&1 | grep -i x-ratelimit
 
 ---
 
-## Step 8 — Click Events Model + Analytics
+## Click Events Model + Analytics
 
 We now add granular per-click tracking with the `ClickEvent` model and a full analytics router.
 
@@ -2822,7 +2826,7 @@ metadata:
   name: postgres
   namespace: url-shortener
 spec:
-  clusterIP: None                              # Headless service for stable DNS
+  clusterIP: None # Headless service for stable DNS
   selector:
     app: postgres
   ports:
@@ -2956,7 +2960,7 @@ metadata:
   name: api
   namespace: url-shortener
 spec:
-  replicas: 2                                  # Start with 2 replicas
+  replicas: 2 # Start with 2 replicas
   selector:
     matchLabels:
       app: api
@@ -2968,7 +2972,7 @@ spec:
       containers:
         - name: api
           image: url-shortener:latest
-          imagePullPolicy: IfNotPresent         # Use local Minikube image
+          imagePullPolicy: IfNotPresent # Use local Minikube image
           ports:
             - containerPort: 8000
           envFrom:
@@ -3010,7 +3014,7 @@ metadata:
   name: api
   namespace: url-shortener
 spec:
-  type: LoadBalancer                           # NodePort on Minikube
+  type: LoadBalancer # NodePort on Minikube
   selector:
     app: api
   ports:
@@ -3046,17 +3050,17 @@ spec:
           averageUtilization: 60
   behavior:
     scaleUp:
-      stabilizationWindowSeconds: 30           # React quickly to spikes
+      stabilizationWindowSeconds: 30 # React quickly to spikes
       policies:
         - type: Pods
           value: 2
-          periodSeconds: 60                    # Add up to 2 pods per minute
+          periodSeconds: 60 # Add up to 2 pods per minute
     scaleDown:
-      stabilizationWindowSeconds: 300          # Wait 5 min before scaling down
+      stabilizationWindowSeconds: 300 # Wait 5 min before scaling down
       policies:
         - type: Pods
           value: 1
-          periodSeconds: 60                    # Remove 1 pod per minute
+          periodSeconds: 60 # Remove 1 pod per minute
 ```
 
 The HPA watches the metrics-server and adjusts the number of API replicas. When average CPU across all pods exceeds 60%, it adds pods (up to 10). When load drops, it removes pods (down to 2). The `behavior` section prevents flapping: scale-up has a short 30-second window to react quickly to traffic spikes, while scale-down waits 5 minutes to avoid premature removal during intermittent load dips.

@@ -2,6 +2,8 @@
 
 ![Bidur Sapkota](https://www.bidursapkota.com.np/images/gravatar.webp "Bidur Sapkota - Developer")&nbsp;[Bidur Sapkota](https://www.bidursapkota.com.np/)
 
+![Design URL Shortener: Backend & System Design Guide by Bidur Sapkota](images/url-1200.webp "Design URL Shortener: Backend & System Design Guide - Blog by Bidur Sapkota")
+
 ## Table of Contents
 
 1. [Requirements & Estimations](#requirements--estimations)

@@ -115,7 +115,7 @@ url-shortener/
 #### **NEW** `requirements.txt`
 
 ```text
-fastapi[standard]==0.115.0
+fastapi[standard]
 ```
 
 `fastapi[standard]` includes `uvicorn` and `pydantic`.
@@ -179,9 +179,6 @@ services:
 ### Build, Run & Verify
 
 ```bash
-mkdir url-shortener && cd url-shortener
-# Create the files listed above, then:
-
 docker compose up --build
 ```
 
@@ -209,30 +206,30 @@ We now add a PostgreSQL database, wire it into the FastAPI app, and verify the c
 
 **Project structure so far:**
 
-```
+```text
 url-shortener/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          ← UPDATED
-│   ├── config.py        ← NEW
-│   └── database.py      ← NEW
+│   ├── main.py          # UPDATED
+│   ├── config.py        # NEW
+│   └── database.py      # NEW
 ├── Dockerfile
-├── compose.yaml         ← UPDATED
-├── requirements.txt     ← UPDATED
-└── .env                 ← NEW
+├── compose.yaml         # UPDATED
+├── requirements.txt     # UPDATED
+└── .env                 # NEW
 ```
 
 #### **UPDATED** `requirements.txt`
 
 ```text
-fastapi[standard]==0.115.0
-sqlalchemy==2.0.35
-psycopg2-binary==2.9.10
-python-dotenv==1.0.1
-pydantic-settings==2.5.2
+fastapi[standard]
+sqlalchemy
+psycopg[binary]
+python-dotenv
+pydantic-settings
 ```
 
-`sqlalchemy` is the ORM for PostgreSQL. `psycopg2-binary` is the PostgreSQL driver. `python-dotenv` loads `.env` files. `pydantic-settings` provides `BaseSettings` for typed configuration.
+`sqlalchemy` is the ORM for PostgreSQL. `psycopg[binary]` is the PostgreSQL driver. `python-dotenv` loads `.env` files. `pydantic-settings` provides `BaseSettings` for typed configuration.
 
 #### **NEW** `.env`
 
@@ -297,11 +294,8 @@ def get_db():
 
 ```python
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
-
 from app.database import Base, engine
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -309,14 +303,12 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     yield
 
-
 app = FastAPI(
     title="URL Shortener API",
     description="A production-ready URL shortening service",
     version="1.0.0",
     lifespan=lifespan,
 )
-
 
 @app.get("/health")
 def health_check():

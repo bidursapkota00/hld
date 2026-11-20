@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.database import Base, engine
+from app.routers import urls
 
 
 @asynccontextmanager
@@ -18,6 +19,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(urls.router)
 
 
 @app.get("/health")

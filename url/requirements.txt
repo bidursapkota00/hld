@@ -3,3 +3,5 @@ sqlalchemy
 psycopg[binary]
 python-dotenv
 pydantic-settings
+httpx
+pytest

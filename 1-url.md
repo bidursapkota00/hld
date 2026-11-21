@@ -241,21 +241,20 @@ BASE_URL=http://localhost:8000
 #### **NEW** `app/config.py`
 
 ```python
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
     base_url: str = "http://localhost:8000"
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()
 ```
 
-`BaseSettings` from `pydantic_settings` automatically reads values from environment variables and `.env` files. Field names are case-insensitive and map to the corresponding `ENV_VAR` names. The `Config` inner class tells Pydantic to also load from the `.env` file.
+`BaseSettings` from `pydantic_settings` automatically reads values from environment variables and `.env` files. Field names are case-insensitive and map to the corresponding `ENV_VAR` names. `model_config = SettingsConfigDict(env_file=".env")` tells Pydantic to also load from the `.env` file.
 
 #### **NEW** `app/database.py`
 
@@ -388,39 +387,39 @@ We create the initial `URL` model (minimal — no click tracking or expiration y
 
 **Project structure so far:**
 
-```
+```text
 url-shortener/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          ← UPDATED
+│   ├── main.py          # UPDATED
 │   ├── config.py
 │   ├── database.py
-│   ├── models.py        ← NEW
-│   ├── schemas.py       ← NEW
-│   ├── shortener.py     ← NEW
+│   ├── models.py        # NEW
+│   ├── schemas.py       # NEW
+│   ├── shortener.py     # NEW
 │   └── routers/
-│       ├── __init__.py  ← NEW
-│       └── urls.py      ← NEW
+│       ├── __init__.py  # NEW
+│       └── urls.py      # NEW
 ├── tests/
-│   ├── __init__.py      ← NEW
-│   ├── conftest.py      ← NEW
-│   └── test_shorten.py  ← NEW
+│   ├── __init__.py      # NEW
+│   ├── conftest.py      # NEW
+│   └── test_shorten.py  # NEW
 ├── Dockerfile
 ├── compose.yaml
-├── requirements.txt     ← UPDATED
+├── requirements.txt     # UPDATED
 └── .env
 ```
 
 #### **UPDATED** `requirements.txt`
 
 ```text
-fastapi[standard]==0.115.0
-sqlalchemy==2.0.35
-psycopg2-binary==2.9.10
-python-dotenv==1.0.1
-pydantic-settings==2.5.2
-httpx==0.27.2
-pytest==8.3.3
+fastapi[standard]
+sqlalchemy
+psycopg[binary]
+python-dotenv
+pydantic-settings
+httpx
+pytest
 ```
 
 `httpx` is used for async HTTP requests and testing. `pytest` is the testing framework.
@@ -429,11 +428,8 @@ pytest==8.3.3
 
 ```python
 from datetime import datetime, timezone
-
 from sqlalchemy import BigInteger, Column, DateTime, String, Text
-
 from app.database import Base
-
 
 class URL(Base):
     __tablename__ = "urls"
@@ -453,7 +449,7 @@ We start with only the essential fields: `id`, `short_code`, `original_url`, and
 
 ```python
 from datetime import datetime
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 
 class URLCreate(BaseModel):
@@ -461,13 +457,12 @@ class URLCreate(BaseModel):
 
 
 class URLResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)   # Allow ORM model to Pydantic conversion
+
     short_code: str
     short_url: str                            # Full shortened URL
     original_url: str
     created_at: datetime
-
-    class Config:
-        from_attributes = True                # Allow ORM model → Pydantic conversion
 ```
 
 `HttpUrl` from Pydantic validates that the input string is a properly formatted URL, rejecting malformed inputs at the schema layer before any business logic runs. `from_attributes = True` (formerly `orm_mode`) tells Pydantic to read data from ORM model attributes instead of expecting a dictionary, enabling `URLResponse.model_validate(url_object)`.
@@ -520,6 +515,8 @@ def generate_short_code(url_id: int, length: int = 7) -> str:
 #### **NEW** `app/routers/urls.py`
 
 ```python
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
@@ -539,7 +536,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
 
     # Create the URL record
     url_record = URL(
-        short_code="placeholder",             # Temporary, replaced below
+        short_code=uuid.uuid4().hex[:8],      # Temporary unique code, replaced below
         original_url=original_url,
     )
 
@@ -597,6 +594,13 @@ def health_check():
 
 `include_router` mounts the URL router so the `POST /shorten` endpoint is accessible.
 
+#### **NEW** `pytest.ini`
+
+```ini
+[pytest]
+pythonpath = .
+```
+
 #### **NEW** `tests/__init__.py`
 
 ```python
@@ -609,7 +613,16 @@ def health_check():
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.types import BigInteger
+
+
+@compiles(BigInteger, "sqlite")
+def compile_biginteger_sqlite(type_, compiler, **kw):
+    """Compile BigInteger as INTEGER in SQLite so autoincrement ROWID works."""
+    return "INTEGER"
+
 
 from app.database import Base, get_db
 from app.main import app
@@ -730,6 +743,8 @@ tests/test_redirect.py   ← NEW
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -750,7 +765,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
 
     # Create the URL record
     url_record = URL(
-        short_code="placeholder",             # Temporary, replaced below
+        short_code=uuid.uuid4().hex[:8],      # Temporary unique code, replaced below
         original_url=original_url,
     )
 
@@ -983,7 +998,7 @@ Each call to `next_id()` assembles a 64-bit int from a millisecond timestamp (41
 
 ```python
 from datetime import datetime
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 
 class URLCreate(BaseModel):
@@ -993,26 +1008,24 @@ class URLCreate(BaseModel):
 
 
 class URLResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)   # Allow ORM model → Pydantic conversion
+
     short_code: str
     short_url: str                            # Full shortened URL
     original_url: str
     created_at: datetime
     expires_at: datetime | None
 
-    class Config:
-        from_attributes = True                # Allow ORM model → Pydantic conversion
-
 
 class URLStats(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     short_code: str
     original_url: str
     click_count: int
     created_at: datetime
     expires_at: datetime | None
     is_active: bool
-
-    class Config:
-        from_attributes = True
 ```
 
 `custom_alias` and `expires_in_days` are now part of the create schema. `URLStats` is added for analytics (used in a later step).
@@ -1076,6 +1089,7 @@ We added `expires_at`, `click_count`, `is_active`, and `user_ip` to the URL mode
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -1118,7 +1132,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
 
     # Create the URL record
     url_record = URL(
-        short_code=short_code or "placeholder",  # Temporary, replaced below
+        short_code=short_code or uuid.uuid4().hex[:8],  # Temporary, replaced below
         original_url=original_url,
         expires_at=expires_at,
         user_ip=request.client.host,
@@ -1172,17 +1186,16 @@ The POST endpoint now handles custom aliases (validating and checking for duplic
 #### **UPDATED** `app/config.py`
 
 ```python
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
     base_url: str = "http://localhost:8000"
     short_code_length: int = 7
     default_ttl_days: int = 365
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()
@@ -1348,18 +1361,17 @@ REDIS_URL=redis://cache:6379/0
 #### **UPDATED** `app/config.py`
 
 ```python
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
     redis_url: str = "redis://localhost:6379/0"
     base_url: str = "http://localhost:8000"
     short_code_length: int = 7
     default_ttl_days: int = 365
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()
@@ -1472,6 +1484,7 @@ def increment_click_count(short_code: str) -> int:
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -1515,7 +1528,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
 
     # Create the URL record
     url_record = URL(
-        short_code=short_code or "placeholder",  # Temporary, replaced below
+        short_code=short_code or uuid.uuid4().hex[:8],  # Temporary, replaced below
         original_url=original_url,
         expires_at=expires_at,
         user_ip=request.client.host,
@@ -1626,19 +1639,18 @@ RATE_LIMIT_PER_MINUTE=60
 #### **UPDATED** `app/config.py`
 
 ```python
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
     redis_url: str = "redis://localhost:6379/0"
     base_url: str = "http://localhost:8000"
     short_code_length: int = 7
     default_ttl_days: int = 365
     rate_limit_per_minute: int = 60
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()
@@ -1890,7 +1902,7 @@ class ClickEvent(Base):
 
 ```python
 from datetime import datetime
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 
 class URLCreate(BaseModel):
@@ -1900,17 +1912,18 @@ class URLCreate(BaseModel):
 
 
 class URLResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)   # Allow ORM model → Pydantic conversion
+
     short_code: str
     short_url: str                            # Full shortened URL
     original_url: str
     created_at: datetime
     expires_at: datetime | None
 
-    class Config:
-        from_attributes = True                # Allow ORM model → Pydantic conversion
-
 
 class URLStats(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     short_code: str
     original_url: str
     click_count: int
@@ -1918,19 +1931,15 @@ class URLStats(BaseModel):
     expires_at: datetime | None
     is_active: bool
 
-    class Config:
-        from_attributes = True
-
 
 class ClickEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     clicked_at: datetime
     referrer: str | None
     user_agent: str | None
     ip_address: str | None
     country: str | None
-
-    class Config:
-        from_attributes = True
 ```
 
 `ClickEventResponse` is the new schema for returning individual click events.
@@ -2045,6 +2054,7 @@ def get_click_summary(short_code: str, db: Session = Depends(get_db)):
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -2088,7 +2098,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
 
     # Create the URL record
     url_record = URL(
-        short_code=short_code or "placeholder",  # Temporary, replaced below
+        short_code=short_code or uuid.uuid4().hex[:8],  # Temporary, replaced below
         original_url=original_url,
         expires_at=expires_at,
         user_ip=request.client.host,
@@ -2517,7 +2527,16 @@ This section recaps the final, complete test files.
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.types import BigInteger
+
+
+@compiles(BigInteger, "sqlite")
+def compile_biginteger_sqlite(type_, compiler, **kw):
+    """Compile BigInteger as INTEGER in SQLite so autoincrement ROWID works."""
+    return "INTEGER"
+
 
 from app.database import Base, get_db
 from app.main import app

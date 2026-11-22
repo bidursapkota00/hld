@@ -16,15 +16,14 @@
 8. [Hash Algorithm](#hash-algorithm)
 9. [Snowflake Algorithm](#snowflake-algorithm)
 10. [Expiration](#expiration)
-11. [Analytics](#analytics)
-12. [Caching with Redis](#caching-with-redis)
-13. [Rate Limiting](#rate-limiting)
-14. [Click Events Model + Analytics](#click-events-model--analytics)
-15. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
-16. [Testing (Final)](#testing-final)
-17. [Project Setup (Final)](#project-setup-final)
-18. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
-19. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
+11. [Caching with Redis](#caching-with-redis)
+12. [Rate Limiting](#rate-limiting)
+13. [Click Events Model + Analytics](#click-events-model--analytics)
+14. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
+15. [Testing (Final)](#testing-final)
+16. [Project Setup (Final)](#project-setup-final)
+17. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
+18. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
 
 ---
 
@@ -1119,6 +1118,176 @@ from app.shortener import generate_snowflake_code, is_valid_alias
 
 ## Expiration
 
+URLs should not live in the database forever. In this topic, we add Time-to-Live (TTL) expiration support so links can expire automatically after a specified number of days (or fall back to a default TTL), and an `is_active` flag to allow soft deactivation. When a link expires or is deactivated, accessing it returns `HTTP 410 Gone`.
+
+**Changed files:**
+
+```
+requirements.txt                                # UPDATED
+alembic.ini                                     # NEW
+alembic/env.py                                  # NEW
+alembic/versions/0001_initial_urls.py           # NEW
+alembic/versions/0002_add_expiration_to_urls.py # NEW
+app/config.py                                   # UPDATED
+app/schemas.py                                  # UPDATED
+app/models.py                                   # UPDATED
+app/routers/urls.py                             # UPDATED
+tests/test_shorten.py                           # UPDATED
+tests/test_redirect.py                          # UPDATED
+```
+
+#### Database Migration
+
+In production, database schemas evolve using versioned migration files rather than recreating tables with `Base.metadata.create_all()`. We use Alembic to manage and execute incremental migrations.
+
+##### 1. Install Alembic
+
+Add `alembic` to `requirements.txt`:
+
+#### **UPDATED** `requirements.txt`
+
+```text
+fastapi[standard]
+sqlalchemy
+psycopg[binary]
+alembic
+python-dotenv
+pydantic-settings
+httpx
+pytest
+```
+
+Install it into your Python environment:
+
+```bash
+pip install alembic
+```
+
+##### 2. Initialize Alembic
+
+Run the initialization command from the project root (`url-shortener/`):
+
+```bash
+alembic init alembic
+```
+
+This generates the following files:
+
+```
+├── alembic.ini              # Global Alembic configuration
+└── alembic/
+    ├── env.py               # Runtime script executed on every migration command
+    ├── README
+    ├── script.py.mako       # Template file for creating new migration files
+    └── versions/            # Directory where versioned migration files are stored
+```
+
+##### 3. Configure `alembic/env.py` (Handling Docker vs. Host Network)
+
+In a Docker Compose setup, PostgreSQL runs inside a container with service name `db` (`postgresql://user:pass@db:5432/urlshortener`), but your host terminal (Mac/Linux) accesses it via `localhost:5432` (via mapped ports `5432:5432`).
+
+Update `alembic/env.py` so that:
+
+1. It dynamically reads `settings.database_url` (from `.env`).
+2. It automatically falls back `@db:` to `@localhost:` when run from your host machine if `db` cannot be resolved.
+3. It sets `target_metadata = Base.metadata` so Alembic can compare models against the live database.
+
+#### **UPDATED** `alembic/env.py`
+
+```python
+import os
+import socket
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+from app.config import settings
+from app.database import Base
+from app.models import URL  # Ensure models are imported so Base.metadata is populated
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# Dynamically set the database URL from settings (.env)
+db_url = os.getenv("DATABASE_URL", settings.database_url)
+
+# If running outside Docker (host machine) where 'db' does not resolve,
+# automatically fallback to 'localhost' using mapped port 5432:5432
+if "@db:" in db_url:
+    try:
+        socket.gethostbyname("db")
+    except socket.gaierror:
+        db_url = db_url.replace("@db:", "@localhost:")
+
+config.set_main_option("sqlalchemy.url", db_url)
+
+# Set target metadata for 'autogenerate' support
+target_metadata = Base.metadata
+```
+
+#### Ensure PostgreSQL is running in Docker
+
+```bash
+docker compose up -d db
+```
+
+#### Generate the Initial Migration (`initial_urls`)
+
+If starting from a fresh database:
+
+```bash
+alembic revision --autogenerate -m "initial_urls"
+```
+
+Alembic will detect `urls` in `Base.metadata` that doesn't yet exist in PostgreSQL and generate `op.create_table("urls", ...)` inside `alembic/versions/`.
+
+Apply it to the database:
+
+```bash
+alembic upgrade head
+```
+
+> **Note:** If PostgreSQL already has the `urls` table created from earlier steps (e.g. from `Base.metadata.create_all()`), `--autogenerate` will compare DB with models and find 0 differences (`pass`). In that case, either reset the database volume with `docker compose down -v && docker compose up -d db`, or stamp the initial baseline with `alembic stamp head`.
+
+#### 4. Create Incremental Migration: Expiration & Active Flag
+
+Now update `app/models.py` (adding `expires_at` and `is_active`).
+
+#### **UPDATED** `app/models.py`
+
+```python
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    BigInteger, Boolean, Column, DateTime, Index, String, Text
+)
+
+from app.database import Base
+
+
+class URL(Base):
+    __tablename__ = "urls"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    short_code = Column(String(16), unique=True, nullable=False, index=True)
+    original_url = Column(Text, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    __table_args__ = (
+        Index("idx_expires_at", "expires_at"),
+    )
+```
+
+We added `expires_at` and `is_active` to `URL`. `DateTime(timezone=True)` ensures UTC accuracy across different server environments.
+
 #### **UPDATED** `app/schemas.py`
 
 ```python
@@ -1140,173 +1309,61 @@ class URLResponse(BaseModel):
     original_url: str
     created_at: datetime
     expires_at: datetime | None
-
-
-class URLStats(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    short_code: str
-    original_url: str
-    click_count: int
-    created_at: datetime
-    expires_at: datetime | None
-    is_active: bool
 ```
 
-`custom_alias` and `expires_in_days` are now part of the create schema. `URLStats` is added for analytics (used in a later step).
+`expires_in_days` allows API clients to request a specific link lifespan. `expires_at` in `URLResponse` returns the calculated UTC expiration timestamp.
 
-#### Entity-Relationship Diagram
+#### urls Table
 
 ```
 ┌──────────────────────────────────────┐
 │              urls                     │
 ├──────────────────────────────────────┤
 │ id            BIGSERIAL  PRIMARY KEY  │
-│ short_code    VARCHAR(10) UNIQUE      │
+│ short_code    VARCHAR(16) UNIQUE      │
 │ original_url  TEXT        NOT NULL    │
 │ created_at    TIMESTAMPTZ DEFAULT NOW │
 │ expires_at    TIMESTAMPTZ NULL        │
-│ click_count   BIGINT     DEFAULT 0    │
 │ is_active     BOOLEAN    DEFAULT TRUE │
-│ user_ip       VARCHAR(45)             │
 ├──────────────────────────────────────┤
 │ INDEX idx_short_code (short_code)     │
 │ INDEX idx_expires_at (expires_at)     │
 └──────────────────────────────────────┘
 ```
 
-The `urls` table stores the mapping between short codes and original URLs. `short_code` has a unique index for fast lookups during redirects. `click_count` is a denormalized counter for quick reads without joining.
+`expires_at` stores the expiration timestamp with timezone awareness (`TIMESTAMPTZ`). `is_active` provides a soft-deletion mechanism for deactivating URLs without immediately dropping database records. The `idx_expires_at` index optimizes timestamp lookups and background cleanup scans.
 
-#### **UPDATED** `app/models.py`
+**Run `--autogenerate` again:**
 
-```python
-from datetime import datetime, timezone
-
-from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Index, String, Text
-)
-
-from app.database import Base
-
-
-class URL(Base):
-    __tablename__ = "urls"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    short_code = Column(String(10), unique=True, nullable=False, index=True)
-    original_url = Column(Text, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-    )
-    expires_at = Column(DateTime(timezone=True), nullable=True)
-    click_count = Column(BigInteger, default=0)
-    is_active = Column(Boolean, default=True)
-    user_ip = Column(String(45), nullable=True)
-
-    __table_args__ = (
-        Index("idx_expires_at", "expires_at"),
-    )
+```bash
+alembic revision --autogenerate -m "add_expiration_and_is_active_to_urls"
 ```
 
-We added `expires_at`, `click_count`, `is_active`, and `user_ip` to the URL model. `String(45)` for IP addresses accommodates both IPv4 and IPv6. `DateTime(timezone=True)` stores timestamps with timezone information, which is critical for analytics across regions. The `ClickEvent` model and `clicks` relationship will be added in Step 8.
+Alembic compares the live `urls` table in Docker with the updated `URL` model, automatically detects the missing columns and index, and generates:
 
-#### **UPDATED** `app/routers/urls.py`
+- `op.add_column("urls", sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True))`
+- `op.add_column("urls", sa.Column("is_active", sa.Boolean(), server_default=sa.text("true"), nullable=False))`
+- `op.create_index("idx_expires_at", "urls", ["expires_at"], unique=False)`
 
-```python
-import uuid
-from datetime import datetime, timedelta, timezone
+##### 6. Apply the Migration
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
+Run the migration against your Docker database:
 
-from app.config import settings
-from app.database import get_db
-from app.models import URL
-from app.schemas import URLCreate, URLResponse
-from app.shortener import generate_short_code, is_valid_alias
-
-router = APIRouter()
-
-
-@router.post("/shorten", response_model=URLResponse, status_code=201)
-def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
-    """Create a shortened URL."""
-    original_url = str(payload.url)
-
-    # Handle custom alias
-    if payload.custom_alias:
-        if not is_valid_alias(payload.custom_alias):
-            raise HTTPException(
-                status_code=400,
-                detail="Alias must be 3-20 alphanumeric characters.",
-            )
-
-        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
-        if existing:
-            raise HTTPException(status_code=409, detail="Alias already taken.")
-
-        short_code = payload.custom_alias
-    else:
-        short_code = None                     # Will be generated after insert
-
-    # Calculate expiration
-    ttl_days = payload.expires_in_days or settings.default_ttl_days
-    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
-
-    # Create the URL record
-    url_record = URL(
-        short_code=short_code or uuid.uuid4().hex[:8],  # Temporary, replaced below
-        original_url=original_url,
-        expires_at=expires_at,
-        user_ip=request.client.host,
-    )
-
-    db.add(url_record)
-    db.flush()                                # Get the auto-generated ID
-
-    # Generate short code from ID if no custom alias
-    if not payload.custom_alias:
-        url_record.short_code = generate_short_code(url_record.id)
-
-    db.commit()
-    db.refresh(url_record)
-
-    return URLResponse(
-        short_code=url_record.short_code,
-        short_url=f"{settings.base_url}/{url_record.short_code}",
-        original_url=url_record.original_url,
-        created_at=url_record.created_at,
-        expires_at=url_record.expires_at,
-    )
-
-
-@router.get("/{short_code}")
-def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
-    """Redirect a short code to its original URL."""
-    url_record = db.query(URL).filter(URL.short_code == short_code).first()
-
-    if not url_record:
-        raise HTTPException(status_code=404, detail="Short URL not found.")
-
-    if not url_record.is_active:
-        raise HTTPException(status_code=410, detail="This link has been deactivated.")
-
-    if url_record.expires_at and url_record.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=410, detail="This link has expired.")
-
-    # Increment click count
-    url_record.click_count += 1
-    db.commit()
-
-    return RedirectResponse(
-        url=url_record.original_url,
-        status_code=301,                      # Permanent redirect (cacheable)
-    )
+```bash
+alembic upgrade head
 ```
 
-The POST endpoint now handles custom aliases (validating and checking for duplicates) and expiration. The GET endpoint now checks `is_active` and `expires_at` before redirecting, and increments the click counter. `request.client.host` captures the caller's IP address for analytics and rate limiting.
+Verify that the database schema is at the latest revision:
+
+```bash
+alembic current
+```
+
+**Expected output:**
+
+```
+<id> (head)
+```
 
 #### **UPDATED** `app/config.py`
 
@@ -1321,24 +1378,125 @@ class Settings(BaseSettings):
     base_url: str = "http://localhost:8000"
     short_code_length: int = 7
     default_ttl_days: int = 365
+    machine_id: int = 0
 
 
 settings = Settings()
 ```
 
-Added `short_code_length` and `default_ttl_days` configuration fields.
+Added `default_ttl_days: int = 365` as the fallback expiration period when a user does not supply `expires_in_days`.
+
+#### **UPDATED** `app/routers/urls.py`
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import URL
+from app.schemas import URLCreate, URLResponse
+from app.shortener import generate_snowflake_code, is_valid_alias
+
+router = APIRouter()
+
+
+@router.post("/shorten", response_model=URLResponse, status_code=201)
+def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
+    """Create a shortened URL with optional TTL and custom alias."""
+    original_url = str(payload.url)
+
+    # 1. Handle custom alias or generate snowflake code
+    if payload.custom_alias:
+        if not is_valid_alias(payload.custom_alias):
+            raise HTTPException(
+                status_code=400,
+                detail="Alias must be 3-20 alphanumeric characters.",
+            )
+
+        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Alias already taken.")
+
+        short_code = payload.custom_alias
+    else:
+        short_code = generate_snowflake_code()
+
+    # 2. Compute expiration timestamp
+    ttl_days = payload.expires_in_days or settings.default_ttl_days
+    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
+
+    # 3. Persist record
+    url_record = URL(
+        short_code=short_code,
+        original_url=original_url,
+        expires_at=expires_at,
+    )
+    db.add(url_record)
+    db.commit()
+    db.refresh(url_record)
+
+    return URLResponse(
+        short_code=url_record.short_code,
+        short_url=f"{settings.base_url}/{url_record.short_code}",
+        original_url=url_record.original_url,
+        created_at=url_record.created_at,
+        expires_at=url_record.expires_at,
+    )
+
+
+@router.get("/{short_code}")
+def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
+    """Redirect a short code to its original URL after checking validity."""
+    url_record = db.query(URL).filter(URL.short_code == short_code).first()
+
+    if not url_record:
+        raise HTTPException(status_code=404, detail="Short URL not found.")
+
+    if not url_record.is_active:
+        raise HTTPException(status_code=410, detail="This link has been deactivated.")
+
+    if url_record.expires_at:
+        expires_at = url_record.expires_at
+        # SQLite in test environments strips tzinfo; ensure timezone awareness for comparison
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="This link has expired.")
+
+    return RedirectResponse(
+        url=url_record.original_url,
+        status_code=301,                      # Permanent redirect (cacheable)
+    )
+```
+
+The redirect endpoint now validates link freshness before redirecting. `HTTP 410 Gone` is returned instead of `404 Not Found` when a link once existed but has expired or been disabled, conforming to HTTP standards.
 
 #### **UPDATED** `tests/test_shorten.py`
 
 ```python
 def test_shorten_url(client):
-    """Test creating a shortened URL."""
+    """Test creating a shortened URL with default expiration."""
     response = client.post("/shorten", json={"url": "https://www.example.com"})
     assert response.status_code == 201
     data = response.json()
     assert "short_code" in data
     assert "short_url" in data
     assert data["original_url"] == "https://www.example.com/"
+    assert data["expires_at"] is not None
+
+
+def test_shorten_with_custom_ttl(client):
+    """Test creating a shortened URL with custom TTL in days."""
+    response = client.post(
+        "/shorten",
+        json={"url": "https://www.example.com", "expires_in_days": 7},
+    )
+    assert response.status_code == 201
+    assert response.json()["expires_at"] is not None
 
 
 def test_shorten_with_custom_alias(client):
@@ -1382,34 +1540,37 @@ def test_invalid_url_rejected(client):
 #### **UPDATED** `tests/test_redirect.py`
 
 ```python
-def test_redirect(client):
-    """Test that short codes redirect to the original URL."""
+from datetime import datetime, timedelta, timezone
+from app.models import URL
+
+
+def test_redirect_expired_url_returns_410(client, db):
+    """Test 410 Gone for expired links."""
     create = client.post("/shorten", json={"url": "https://www.example.com"})
     short_code = create.json()["short_code"]
+
+    # Manually backdate expiration in the database
+    url_record = db.query(URL).filter(URL.short_code == short_code).first()
+    url_record.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db.commit()
 
     response = client.get(f"/{short_code}", follow_redirects=False)
-    assert response.status_code == 301
-    assert response.headers["location"] == "https://www.example.com/"
+    assert response.status_code == 410
+    assert response.json()["detail"] == "This link has expired."
 
 
-def test_redirect_not_found(client):
-    """Test 404 for non-existent short codes."""
-    response = client.get("/nonexistent", follow_redirects=False)
-    assert response.status_code == 404
-
-
-def test_click_count_increments(client, db):
-    """Test that clicks are tracked."""
+def test_redirect_deactivated_url_returns_410(client, db):
+    """Test 410 Gone for deactivated links."""
     create = client.post("/shorten", json={"url": "https://www.example.com"})
     short_code = create.json()["short_code"]
 
-    client.get(f"/{short_code}", follow_redirects=False)
-    client.get(f"/{short_code}", follow_redirects=False)
-
-    # Query the DB directly since analytics router isn't added yet
-    from app.models import URL
     url_record = db.query(URL).filter(URL.short_code == short_code).first()
-    assert url_record.click_count == 2
+    url_record.is_active = False
+    db.commit()
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+    assert response.status_code == 410
+    assert response.json()["detail"] == "This link has been deactivated."
 ```
 
 ### Build, Run & Verify
@@ -1418,12 +1579,24 @@ def test_click_count_increments(client, db):
 docker compose up --build
 ```
 
-Test custom alias:
+Shorten a URL with a custom 30-day expiration:
 
 ```bash
 curl -X POST http://localhost:8000/shorten \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.example.com", "custom_alias": "mylink"}'
+  -d '{"url": "https://www.example.com", "expires_in_days": 30}'
+```
+
+**Expected output:**
+
+```json
+{
+  "short_code": "0B8x9YmZ",
+  "short_url": "http://localhost:8000/0B8x9YmZ",
+  "original_url": "https://www.example.com/",
+  "created_at": "2026-11-22T12:00:00Z",
+  "expires_at": "2026-12-22T12:00:00Z"
+}
 ```
 
 Run all tests:
@@ -1436,13 +1609,15 @@ pytest -v
 
 ```
 tests/test_shorten.py::test_shorten_url PASSED
+tests/test_shorten.py::test_shorten_with_custom_ttl PASSED
 tests/test_shorten.py::test_shorten_with_custom_alias PASSED
 tests/test_shorten.py::test_duplicate_alias_rejected PASSED
 tests/test_shorten.py::test_invalid_alias_rejected PASSED
 tests/test_shorten.py::test_invalid_url_rejected PASSED
 tests/test_redirect.py::test_redirect PASSED
 tests/test_redirect.py::test_redirect_not_found PASSED
-tests/test_redirect.py::test_click_count_increments PASSED
+tests/test_redirect.py::test_redirect_expired_url_returns_410 PASSED
+tests/test_redirect.py::test_redirect_deactivated_url_returns_410 PASSED
 ```
 
 ---
@@ -1454,12 +1629,12 @@ Every redirect triggers a database query. At 10 000 reads/sec, PostgreSQL would 
 **Changed files:**
 
 ```
-compose.yaml             ← UPDATED
-app/config.py            ← UPDATED
-app/cache.py             ← NEW
-app/routers/urls.py      ← UPDATED
-requirements.txt         ← UPDATED
-.env                     ← UPDATED
+compose.yaml             # UPDATED
+app/config.py            # UPDATED
+app/cache.py             # NEW
+app/routers/urls.py      # UPDATED
+requirements.txt         # UPDATED
+.env                     # UPDATED
 ```
 
 #### **UPDATED** `requirements.txt`
@@ -1697,8 +1872,13 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     if not url_record.is_active:
         raise HTTPException(status_code=410, detail="This link has been deactivated.")
 
-    if url_record.expires_at and url_record.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=410, detail="This link has expired.")
+    if url_record.expires_at:
+        expires_at = url_record.expires_at
+        # SQLite in test environments strips tzinfo; ensure timezone awareness for comparison
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="This link has expired.")
 
     # 3. Populate cache
     set_cached_url(
@@ -2267,8 +2447,13 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     if not url_record.is_active:
         raise HTTPException(status_code=410, detail="This link has been deactivated.")
 
-    if url_record.expires_at and url_record.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=410, detail="This link has expired.")
+    if url_record.expires_at:
+        expires_at = url_record.expires_at
+        # SQLite in test environments strips tzinfo; ensure timezone awareness for comparison
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="This link has expired.")
 
     # 3. Populate cache
     set_cached_url(

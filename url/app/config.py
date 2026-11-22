@@ -6,8 +6,9 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
     base_url: str = "http://localhost:8000"
-    machine_id: int = 0                       # Worker node ID (0-1023)
-
+    short_code_length: int = 7
+    default_ttl_days: int = 365
+    machine_id: int = 0
 
 
 settings = Settings()

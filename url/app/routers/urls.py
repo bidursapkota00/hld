@@ -1,4 +1,5 @@
-import uuid
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -7,19 +8,17 @@ from app.config import settings
 from app.database import get_db
 from app.models import URL
 from app.schemas import URLCreate, URLResponse
-from app.shortener import generate_from_hash, generate_snowflake_code
-from app.shortener import is_valid_alias
-
+from app.shortener import generate_snowflake_code, is_valid_alias
 
 router = APIRouter()
 
 
 @router.post("/shorten", response_model=URLResponse, status_code=201)
 def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
-    """Create a shortened URL using Snowflake ID or custom alias."""
+    """Create a shortened URL with optional TTL and custom alias."""
     original_url = str(payload.url)
 
-    # Handle custom alias or generate code in-memory
+    # 1. Handle custom alias or generate snowflake code
     if payload.custom_alias:
         if not is_valid_alias(payload.custom_alias):
             raise HTTPException(
@@ -35,10 +34,15 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
     else:
         short_code = generate_snowflake_code()
 
-    # Direct single-step insert (no temporary UUID or db.flush required)
+    # 2. Compute expiration timestamp
+    ttl_days = payload.expires_in_days or settings.default_ttl_days
+    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
+
+    # 3. Persist record
     url_record = URL(
         short_code=short_code,
         original_url=original_url,
+        expires_at=expires_at,
     )
     db.add(url_record)
     db.commit()
@@ -49,15 +53,27 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
         short_url=f"{settings.base_url}/{url_record.short_code}",
         original_url=url_record.original_url,
         created_at=url_record.created_at,
+        expires_at=url_record.expires_at,
     )
+
 
 @router.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
-    """Redirect a short code to its original URL."""
+    """Redirect a short code to its original URL after checking validity."""
     url_record = db.query(URL).filter(URL.short_code == short_code).first()
 
     if not url_record:
         raise HTTPException(status_code=404, detail="Short URL not found.")
+
+    if not url_record.is_active:
+        raise HTTPException(status_code=410, detail="This link has been deactivated.")
+
+    if url_record.expires_at:
+        expires_at = url_record.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="This link has expired.")
 
     return RedirectResponse(
         url=url_record.original_url,

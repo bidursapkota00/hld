@@ -1124,10 +1124,12 @@ URLs should not live in the database forever. In this topic, we add Time-to-Live
 
 ```
 requirements.txt                                # UPDATED
+compose.yaml                                    # UPDATED
 alembic.ini                                     # NEW
 alembic/env.py                                  # NEW
 alembic/versions/0001_initial_urls.py           # NEW
 alembic/versions/0002_add_expiration_to_urls.py # NEW
+app/main.py                                     # UPDATED
 app/config.py                                   # UPDATED
 app/schemas.py                                  # UPDATED
 app/models.py                                   # UPDATED
@@ -1345,7 +1347,7 @@ Alembic compares the live `urls` table in Docker with the updated `URL` model, a
 - `op.add_column("urls", sa.Column("is_active", sa.Boolean(), server_default=sa.text("true"), nullable=False))`
 - `op.create_index("idx_expires_at", "urls", ["expires_at"], unique=False)`
 
-##### 6. Apply the Migration
+##### 5. Apply the Migration
 
 Run the migration against your Docker database:
 
@@ -1363,6 +1365,73 @@ alembic current
 
 ```
 <id> (head)
+```
+
+##### 6. Automate Migrations in Docker & Clean Up `app/main.py`
+
+Now that Alembic handles database migrations:
+
+1. **Can `lifespan` be removed completely from FastAPI?**
+   **Yes!** Previously, `lifespan` existed solely to call `Base.metadata.create_all(bind=engine)`. Because schema management is now owned by Alembic, the entire `lifespan` context manager is redundant and can be removed completely.
+2. **How migrations run automatically in Docker:**
+   Update `compose.yaml` so the `api` container runs `alembic upgrade head` before booting FastAPI.
+
+#### **UPDATED** `app/main.py`
+
+```python
+from fastapi import FastAPI
+
+from app.routers import urls
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A production-ready URL shortening service",
+    version="1.0.0",
+)
+
+app.include_router(urls.router)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+```
+
+#### **UPDATED** `compose.yaml`
+
+```yaml
+services:
+  api:
+    build: .
+    command: sh -c "alembic upgrade head && fastapi run app/main.py --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - BASE_URL=http://localhost:8000
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
 ```
 
 #### **UPDATED** `app/config.py`
@@ -1685,6 +1754,7 @@ Added `redis_url`.
 services:
   api:
     build: .
+    command: sh -c "alembic upgrade head && fastapi run app/main.py --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
     environment:
@@ -2017,27 +2087,15 @@ A **sliding window** with Redis sorted sets is more accurate than fixed-window c
 #### **UPDATED** `app/main.py`
 
 ```python
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 
-from app.database import Base, engine
 from app.routers import urls
 from app.rate_limiter import RateLimiterMiddleware
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Create tables on startup."""
-    Base.metadata.create_all(bind=engine)
-    yield
-
 
 app = FastAPI(
     title="URL Shortener API",
     description="A production-ready URL shortening service",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(RateLimiterMiddleware)
@@ -2484,27 +2542,15 @@ The HTTP `Referer` header (note the deliberate misspelling in the HTTP spec) tel
 #### **UPDATED** `app/main.py`
 
 ```python
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 
-from app.database import Base, engine
 from app.routers import urls, analytics
 from app.rate_limiter import RateLimiterMiddleware
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Create tables on startup."""
-    Base.metadata.create_all(bind=engine)
-    yield
-
 
 app = FastAPI(
     title="URL Shortener API",
     description="A production-ready URL shortening service",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(RateLimiterMiddleware)
@@ -2754,6 +2800,7 @@ tests/
 services:
   api:
     build: .
+    command: sh -c "alembic upgrade head && fastapi run app/main.py --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
     environment:

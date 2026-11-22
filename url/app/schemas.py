@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, HttpUrl
 
 class URLCreate(BaseModel):
     url: HttpUrl                              # Validates that input is a valid URL
-
+    custom_alias: str | None = None           # Optional custom short code
 
 class URLResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)   # Allow ORM model to Pydantic conversion

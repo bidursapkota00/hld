@@ -12,15 +12,19 @@
 4. [Connect to PostgreSQL](#connect-to-postgresql)
 5. [URL Model + POST API + Tests](#url-model--post-api--tests)
 6. [Redirect Endpoint + Tests](#redirect-endpoint--tests)
-7. [Better Algorithms, Custom Aliases & Expiration](#better-algorithms-custom-aliases--expiration)
-8. [Caching with Redis](#caching-with-redis)
-9. [Rate Limiting](#rate-limiting)
-10. [Click Events Model + Analytics](#click-events-model--analytics)
-11. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
-12. [Testing (Final)](#testing-final)
-13. [Project Setup (Final)](#project-setup-final)
-14. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
-15. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
+7. [Custom Aliases](#custom-aliases)
+8. [Hash Algorithm](#hash-algorithm)
+9. [Snowflake Algorithm](#snowflake-algorithm)
+10. [Expiration](#expiration)
+11. [Analytics](#analytics)
+12. [Caching with Redis](#caching-with-redis)
+13. [Rate Limiting](#rate-limiting)
+14. [Click Events Model + Analytics](#click-events-model--analytics)
+15. [Docker & Docker Compose (Final)](#docker--docker-compose-final)
+16. [Testing (Final)](#testing-final)
+17. [Project Setup (Final)](#project-setup-final)
+18. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
+19. [Deploying to GCP (Cloud Run)](#deploying-to-gcp-cloud-run)
 
 ---
 
@@ -736,55 +740,14 @@ We add the `GET /{short_code}` redirect endpoint (simple version — no cache, n
 **Changed files:**
 
 ```
-app/routers/urls.py      ← UPDATED
-tests/test_redirect.py   ← NEW
+app/routers/urls.py      # UPDATED
+tests/test_redirect.py   # NEW
 ```
 
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
-import uuid
-
-from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
-
-from app.config import settings
-from app.database import get_db
-from app.models import URL
-from app.schemas import URLCreate, URLResponse
-from app.shortener import generate_short_code
-
-router = APIRouter()
-
-
-@router.post("/shorten", response_model=URLResponse, status_code=201)
-def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
-    """Create a shortened URL."""
-    original_url = str(payload.url)
-
-    # Create the URL record
-    url_record = URL(
-        short_code=uuid.uuid4().hex[:8],      # Temporary unique code, replaced below
-        original_url=original_url,
-    )
-
-    db.add(url_record)
-    db.flush()                                # Get the auto-generated ID
-
-    # Generate short code from ID
-    url_record.short_code = generate_short_code(url_record.id)
-
-    db.commit()
-    db.refresh(url_record)
-
-    return URLResponse(
-        short_code=url_record.short_code,
-        short_url=f"{settings.base_url}/{url_record.short_code}",
-        original_url=url_record.original_url,
-        created_at=url_record.created_at,
-    )
-
 
 @router.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
@@ -854,7 +817,7 @@ tests/test_redirect.py::test_redirect_not_found PASSED
 
 ---
 
-## Better Algorithms, Custom Aliases & Expiration
+## Custom Aliases
 
 We now enhance the system with multiple shortening algorithms, custom alias support, URL expiration, and click counting.
 
@@ -872,54 +835,89 @@ The core challenge is generating a unique, short, and collision-resistant code f
 
 For this project, we use **Base62 encoding of an auto-incrementing counter** combined with **random padding** to prevent sequential guessing.
 
-**Changed files:**
+#### **UPDATED** `app/schemas.py`
 
-```
-app/shortener.py         ← UPDATED
-app/schemas.py           ← UPDATED
-app/models.py            ← UPDATED
-app/routers/urls.py      ← UPDATED
-tests/test_shorten.py    ← UPDATED
-tests/test_redirect.py   ← UPDATED
+Add custom_alias attribute.
+
+```py
+class URLCreate(BaseModel):
+    url: HttpUrl                              # Validates that input is a valid URL
+    custom_alias: str | None = None           # Optional custom short code
 ```
 
 #### **UPDATED** `app/shortener.py`
 
+Allow users to create own short url but with validation.
+
 ```python
+def is_valid_alias(alias: str) -> bool:
+    """Check that a custom alias contains only Base62 characters."""
+    return all(c in BASE62 for c in alias) and 3 <= len(alias) <= 20
+```
+
+`is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long.
+
+#### **UPDATED** `app/urls/shortener.py`
+
+```py
+from app.shortener import is_valid_alias
+
+# ...
+    db.flush()                                # Get the auto-generated ID
+
+    # Handle custom alias or generate code in-memory
+    if payload.custom_alias:
+        if not is_valid_alias(payload.custom_alias):
+            raise HTTPException(
+                status_code=400,
+                detail="Alias must be 3-20 alphanumeric characters.",
+            )
+
+        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Alias already taken.")
+
+        url_record.short_code = payload.custom_alias
+    else:
+        # Generate short code from ID
+        url_record.short_code = generate_short_code(url_record.id)
+
+
+    db.commit()
+# ...
+```
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Create a URL:
+
+```bash
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com/very/long/path", "custom_alias": "ab123"}'
+```
+
+**Output:**
+
+```text
+{"short_code":"ab123","short_url":"http://localhost:8000/ab123","original_url":"https://www.example.com/very/long/path","created_at":"2026-11-21T07:59:27.672985Z"}
+```
+
+---
+
+## Hash Algorithm
+
+#### **UPDATED** `app/shortener.py`
+
+New algorithm using hash of original url.
+
+```py
 import hashlib
-import string
-import random
-
-BASE62 = string.ascii_letters + string.digits   # a-zA-Z0-9 (62 chars)
-
-
-def encode_base62(num: int) -> str:
-    """Convert a positive integer to a Base62 string."""
-    if num == 0:
-        return BASE62[0]
-
-    result = []
-    while num > 0:
-        result.append(BASE62[num % 62])
-        num //= 62
-
-    return "".join(reversed(result))
-
-
-def generate_short_code(url_id: int, length: int = 7) -> str:
-    """
-    Generate a short code by Base62-encoding the database ID
-    and padding with random characters to reach the desired length.
-    """
-    base = encode_base62(url_id)
-
-    if len(base) >= length:
-        return base[:length]
-
-    # Pad with random Base62 characters to desired length
-    padding = "".join(random.choices(BASE62, k=length - len(base)))
-    return base + padding
-
+# ...
 
 def generate_from_hash(original_url: str, length: int = 7) -> str:
     """
@@ -930,22 +928,142 @@ def generate_from_hash(original_url: str, length: int = 7) -> str:
     num = int(hash_digest[:12], 16)           # Use first 12 hex chars
     code = encode_base62(num)
     return code[:length]
-
-
-def is_valid_alias(alias: str) -> bool:
-    """Check that a custom alias contains only Base62 characters."""
-    return all(c in BASE62 for c in alias) and 3 <= len(alias) <= 20
 ```
 
-`generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL. `is_valid_alias` validates custom aliases to allow only alphanumeric characters between 3 and 20 characters long. **For Production use Snowflake Id with Base62 encoding without truncation or random padding.**
+`generate_from_hash` is a fallback that hashes the URL itself, giving a deterministic code for the same input URL.
 
-#### Production: Snowflake ID + Base62
+#### **UPDATED** `app/routers/urls.py`
+
+```py
+from app.shortener import generate_from_hash, is_valid_alias
+
+@router.post("/shorten", response_model=URLResponse, status_code=201)
+def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
+    """Create a shortened URL using Snowflake ID or custom alias."""
+    original_url = str(payload.url)
+
+    # Handle custom alias or generate code in-memory
+    if payload.custom_alias:
+        if not is_valid_alias(payload.custom_alias):
+            raise HTTPException(
+                status_code=400,
+                detail="Alias must be 3-20 alphanumeric characters.",
+            )
+
+        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Alias already taken.")
+
+        short_code = payload.custom_alias
+    else:
+        short_code = generate_from_hash(original_url)
+
+    # Direct single-step insert (no temporary UUID or db.flush required)
+    url_record = URL(
+        short_code=short_code,
+        original_url=original_url,
+    )
+    db.add(url_record)
+    db.commit()
+    db.refresh(url_record)
+
+    return URLResponse(
+        short_code=url_record.short_code,
+        short_url=f"{settings.base_url}/{url_record.short_code}",
+        original_url=url_record.original_url,
+        created_at=url_record.created_at,
+    )
+```
+
+### Build, Run & Verify
+
+```bash
+docker compose up --build
+```
+
+Create a URL:
+
+```bash
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example.com/very/long/path"}'
+
+# Redirect (follow redirects with -L)
+curl -L http://localhost:8000/<short_code>
+```
+
+**Output:**
+
+```text
+{"short_code":"brm8LUk","short_url":"http://localhost:8000/brm8LUk","original_url":"https://www.example.com/very/long/path","created_at":"2026-11-21T12:12:50.145356Z"}
+```
+
+---
+
+## Snowflake Algorithm
+
+For production systems with distributed nodes, we can replace the database auto-increment counter with Twitter's Snowflake ID generator. This removes the need for temporary UUIDs and two-step database flushes (`db.flush()`).
+
+**Changed files:**
+
+```
+app/config.py            # UPDATED
+app/models.py            # UPDATED
+app/shortener.py         # UPDATED
+app/routers/urls.py      # UPDATED
+```
+
+#### **UPDATED** `app/config.py`
+
+Add `machine_id` to `Settings` to identify worker instances (0–1023):
 
 ```python
-import time, threading, string
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE62 = string.ascii_letters + string.digits
-EPOCH = 1_704_067_200_000  # 2024-01-01 UTC in ms
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
+    base_url: str = "http://localhost:8000"
+    machine_id: int = 0                       # Worker node ID (0-1023)
+
+
+settings = Settings()
+```
+
+#### **UPDATED** `app/models.py`
+
+Expand `short_code` column length to `VARCHAR(16)` because 64-bit Snowflake IDs encoded in Base62 produce up to 11 characters ($62^{11} \approx 5.2 \times 10^{19} > 2^{64}$):
+
+```python
+# In app/models.py:
+class URL(Base):
+    __tablename__ = "urls"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    short_code = Column(String(16), unique=True, nullable=False, index=True)
+    original_url = Column(Text, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+```
+
+#### **UPDATED** `app/shortener.py`
+
+Add the `Snowflake` class and `generate_snowflake_code()` helper function:
+
+```python
+import hashlib
+import string
+import threading
+import time
+
+from app.config import settings
+
+BASE62 = string.ascii_letters + string.digits   # a-zA-Z0-9 (62 chars)
+EPOCH = 1_704_067_200_000                       # 2024-01-01 UTC in ms
 
 
 class Snowflake:
@@ -955,7 +1073,7 @@ class Snowflake:
     """
 
     def __init__(self, machine_id: int = 0):
-        assert 0 <= machine_id < 1024
+        assert 0 <= machine_id < 1024, "machine_id must be between 0 and 1023"
         self.machine_id = machine_id
         self._seq = 0
         self._last_ts = -1
@@ -966,7 +1084,7 @@ class Snowflake:
             ts = int(time.time() * 1000) - EPOCH
             if ts == self._last_ts:
                 self._seq = (self._seq + 1) & 0xFFF
-                if self._seq == 0:          # 4096 exhausted, wait 1 ms
+                if self._seq == 0:              # 4096 exhausted, wait 1 ms
                     while ts <= self._last_ts:
                         ts = int(time.time() * 1000) - EPOCH
             else:
@@ -975,24 +1093,31 @@ class Snowflake:
             return (ts << 22) | (self.machine_id << 12) | self._seq
 
 
-def to_base62(num: int) -> str:
-    if num == 0:
-        return BASE62[0]
-    chars = []
-    while num:
-        chars.append(BASE62[num % 62])
-        num //= 62
-    return "".join(reversed(chars))
+# Singleton instance per worker process
+snowflake = Snowflake(machine_id=settings.machine_id)
 
 
-# Usage
-_sf = Snowflake(machine_id=0)
-
-def generate_short_code() -> str:
-    return to_base62(_sf.next_id())    # ~11 chars, unique, non-guessable
+def generate_snowflake_code() -> str:
+    """Generate an ~11-character unique, time-sortable short code in memory."""
+    return encode_base62(snowflake.next_id())
 ```
 
 Each call to `next_id()` assembles a 64-bit int from a millisecond timestamp (41 bits), a machine identifier (10 bits, supporting 1,024 workers), and a sequence counter (12 bits, 4,096 IDs per millisecond). Base62-encoding this directly produces an **~11-character** code that is unique, time-sortable, and non-sequential — no retries or DB lookups needed.
+
+#### **UPDATED** `app/routers/urls.py`
+
+```python
+from app.shortener import generate_snowflake_code, is_valid_alias
+
+# ...
+    else:
+        short_code = generate_snowflake_code()
+# ...
+```
+
+---
+
+## Expiration
 
 #### **UPDATED** `app/schemas.py`
 

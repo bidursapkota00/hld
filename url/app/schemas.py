@@ -15,3 +15,23 @@ class URLResponse(BaseModel):
     original_url: str
     created_at: datetime
     expires_at: datetime | None
+
+class URLStats(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    short_code: str
+    original_url: str
+    click_count: int
+    created_at: datetime
+    expires_at: datetime | None
+    is_active: bool
+
+
+class ClickEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    clicked_at: datetime
+    referrer: str | None
+    user_agent: str | None
+    ip_address: str | None
+    country: str | None

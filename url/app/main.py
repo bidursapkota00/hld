@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import urls
+from app.routers import urls, analytics
 from app.rate_limiter import RateLimiterMiddleware
 
 
@@ -18,3 +18,4 @@ def health_check():
     return {"status": "healthy"}
 
 app.include_router(urls.router)
+app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])

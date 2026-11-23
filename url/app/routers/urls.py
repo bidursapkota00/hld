@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models import URL
+from app.models import URL, ClickEvent
 from app.schemas import URLCreate, URLResponse
 from app.shortener import generate_snowflake_code, is_valid_alias
 from app.cache import get_cached_url, set_cached_url, increment_click_count
@@ -44,6 +44,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
         short_code=short_code,
         original_url=original_url,
         expires_at=expires_at,
+        user_ip=request.client.host,
     )
     db.add(url_record)
     db.commit()
@@ -59,6 +60,7 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
 
 
 
+
 @router.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
     """Redirect with Redis cache layer."""
@@ -66,7 +68,7 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     # 1. Check cache first
     cached = get_cached_url(short_code)
     if cached:
-        # increment_click_count(short_code)
+        increment_click_count(short_code)
         print(f"CACHE HIT: {short_code}")
         return RedirectResponse(url=cached["original_url"], status_code=301)
 
@@ -95,8 +97,18 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
         url_record.expires_at.isoformat() if url_record.expires_at else None,
     )
 
-    # 4. Update count and redirect
-    # url_record.click_count += 1
+    # 4. Record click event
+    click_event = ClickEvent(
+        url_id=url_record.id,
+        referrer=request.headers.get("referer"),      # Note: HTTP header is "referer"
+        user_agent=request.headers.get("user-agent"),
+        ip_address=request.client.host,
+        country=None,                                  # Populated by GeoIP service
+    )
+    db.add(click_event)
+
+    # 5. Update count and redirect
+    url_record.click_count += 1
     db.commit()
 
     return RedirectResponse(url=url_record.original_url, status_code=301)

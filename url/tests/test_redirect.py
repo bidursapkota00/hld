@@ -45,3 +45,14 @@ def test_redirect_deactivated_url_returns_410(client, db):
     response = client.get(f"/{short_code}", follow_redirects=False)
     assert response.status_code == 410
     assert response.json()["detail"] == "This link has been deactivated."
+
+def test_click_count_increments(client):
+    """Test that clicks are tracked."""
+    create = client.post("/shorten", json={"url": "https://www.example.com"})
+    short_code = create.json()["short_code"]
+
+    client.get(f"/{short_code}", follow_redirects=False)
+    client.get(f"/{short_code}", follow_redirects=False)
+
+    stats = client.get(f"/api/analytics/{short_code}")
+    assert stats.json()["click_count"] == 2

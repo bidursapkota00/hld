@@ -1863,7 +1863,6 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     # 1. Check cache first
     cached = get_cached_url(short_code)
     if cached:
-        # increment_click_count(short_code)
         print(f"CACHE HIT: {short_code}")
         return RedirectResponse(url=cached["original_url"], status_code=301)
 
@@ -1892,14 +1891,12 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
         url_record.expires_at.isoformat() if url_record.expires_at else None,
     )
 
-    # 4. Update count and redirect
-    # url_record.click_count += 1
     db.commit()
 
     return RedirectResponse(url=url_record.original_url, status_code=301)
 ```
 
-The cache-aside pattern works as follows: check Redis first (step 1). If the URL is cached, increment the counter in Redis atomically and redirect immediately without touching PostgreSQL. On a cache miss (step 2), query the database and populate the cache (step 3) so subsequent requests hit Redis. In production, you would run a periodic batch job to sync `clicks:{short_code}` counters from Redis back to PostgreSQL's `click_count` column, combining Redis speed with PostgreSQL durability.
+The cache-aside pattern works as follows: check Redis first (step 1). If the URL is cached, Redis atomically and redirect immediately without touching PostgreSQL. On a cache miss (step 2), query the database and populate the cache (step 3) so subsequent requests hit Redis.
 
 ### Build, Run & Verify
 
@@ -2099,22 +2096,22 @@ We now add granular per-click tracking with the `ClickEvent` model and a full an
 **Changed files:**
 
 ```
-app/models.py            ← UPDATED
-app/schemas.py           ← UPDATED
-app/routers/analytics.py ← NEW
-app/routers/urls.py      ← UPDATED
-app/main.py              ← UPDATED
-tests/test_redirect.py   ← UPDATED
+app/models.py            # UPDATED
+app/schemas.py           # UPDATED
+app/routers/analytics.py # NEW
+app/routers/urls.py      # UPDATED
+app/main.py              # UPDATED
+tests/test_redirect.py   # UPDATED
 ```
 
-#### Entity-Relationship Diagram (Final)
+#### Table Schemas (Final)
 
 ```
 ┌──────────────────────────────────────┐
 │              urls                     │
 ├──────────────────────────────────────┤
 │ id            BIGSERIAL  PRIMARY KEY  │
-│ short_code    VARCHAR(10) UNIQUE      │
+│ short_code    VARCHAR(16) UNIQUE      │
 │ original_url  TEXT        NOT NULL    │
 │ created_at    TIMESTAMPTZ DEFAULT NOW │
 │ expires_at    TIMESTAMPTZ NULL        │
@@ -2161,7 +2158,7 @@ class URL(Base):
     __tablename__ = "urls"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    short_code = Column(String(10), unique=True, nullable=False, index=True)
+    short_code = Column(String(16), unique=True, nullable=False, index=True)
     original_url = Column(Text, nullable=False)
     created_at = Column(
         DateTime(timezone=True),
@@ -2203,29 +2200,21 @@ class ClickEvent(Base):
 
 `relationship()` sets up the ORM-level link between `URL` and `ClickEvent` so you can access `url.clicks` or `click.url` without writing joins manually. `__table_args__` adds composite or additional indexes beyond the ones declared inline on columns.
 
+**Run make migrations:**
+
+```bash
+alembic revision --autogenerate -m "add_click_event"
+```
+
+**Apply migration:**
+
+```bash
+alembic upgrade head
+```
+
 #### **UPDATED** `app/schemas.py`
 
 ```python
-from datetime import datetime
-from pydantic import BaseModel, ConfigDict, HttpUrl
-
-
-class URLCreate(BaseModel):
-    url: HttpUrl                              # Validates that input is a valid URL
-    custom_alias: str | None = None           # Optional custom short code
-    expires_in_days: int | None = None        # Optional TTL in days
-
-
-class URLResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)   # Allow ORM model → Pydantic conversion
-
-    short_code: str
-    short_url: str                            # Full shortened URL
-    original_url: str
-    created_at: datetime
-    expires_at: datetime | None
-
-
 class URLStats(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -2359,86 +2348,31 @@ def get_click_summary(short_code: str, db: Session = Depends(get_db)):
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
-import uuid
-from datetime import datetime, timedelta, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
-
-from app.config import settings
-from app.database import get_db
 from app.models import URL, ClickEvent
-from app.schemas import URLCreate, URLResponse
-from app.shortener import generate_short_code, is_valid_alias
 from app.cache import get_cached_url, set_cached_url, increment_click_count
-
-router = APIRouter()
-
 
 @router.post("/shorten", response_model=URLResponse, status_code=201)
 def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
-    """Create a shortened URL."""
-    original_url = str(payload.url)
-
-    # Handle custom alias
-    if payload.custom_alias:
-        if not is_valid_alias(payload.custom_alias):
-            raise HTTPException(
-                status_code=400,
-                detail="Alias must be 3-20 alphanumeric characters.",
-            )
-
-        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
-        if existing:
-            raise HTTPException(status_code=409, detail="Alias already taken.")
-
-        short_code = payload.custom_alias
-    else:
-        short_code = None                     # Will be generated after insert
-
-    # Calculate expiration
-    ttl_days = payload.expires_in_days or settings.default_ttl_days
-    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
-
-    # Create the URL record
+  # ...
     url_record = URL(
-        short_code=short_code or uuid.uuid4().hex[:8],  # Temporary, replaced below
-        original_url=original_url,
-        expires_at=expires_at,
+      # ...
         user_ip=request.client.host,
-    )
-
-    db.add(url_record)
-    db.flush()                                # Get the auto-generated ID
-
-    # Generate short code from ID if no custom alias
-    if not payload.custom_alias:
-        url_record.short_code = generate_short_code(url_record.id)
-
-    db.commit()
-    db.refresh(url_record)
-
-    return URLResponse(
-        short_code=url_record.short_code,
-        short_url=f"{settings.base_url}/{url_record.short_code}",
-        original_url=url_record.original_url,
-        created_at=url_record.created_at,
-        expires_at=url_record.expires_at,
     )
 
 
 @router.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
-    """Redirect with Redis cache layer and click event recording."""
+    """Redirect with Redis cache layer."""
 
     # 1. Check cache first
     cached = get_cached_url(short_code)
     if cached:
         increment_click_count(short_code)
+        print(f"CACHE HIT: {short_code}")
         return RedirectResponse(url=cached["original_url"], status_code=301)
 
-    # 2. Cache miss → query database
+    # 2. Cache miss then query database
+    print(f"CACHE MISS: {short_code}")
     url_record = db.query(URL).filter(URL.short_code == short_code).first()
 
     if not url_record:
@@ -2479,52 +2413,80 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     return RedirectResponse(url=url_record.original_url, status_code=301)
 ```
 
-The HTTP `Referer` header (note the deliberate misspelling in the HTTP spec) tells you which page the user clicked the link from. In production, you would send click events to a message queue (Pub/Sub, Kafka) and process them asynchronously to avoid slowing down the redirect response.
+The HTTP `Referer` header (note the deliberate misspelling in the HTTP spec) tells you which page the user clicked the link from. In production, you would send click events to a message queue (Pub/Sub, Kafka) and process them asynchronously to avoid slowing down the redirect response. In production, you would run a periodic batch job to sync `clicks:{short_code}` counters from Redis back to PostgreSQL's `click_count` column, combining Redis speed with PostgreSQL durability.
+
+> **Note:** Use 302 to test clicks on GET /short-code, otherwise browser caches and click count does not change.
+
+#### **NEW** `app/flush_clicks.py`
+
+```py
+from app.database import SessionLocal
+from app.models import URL
+from app.cache import redis_client
+
+
+def flush_click_counts():
+    """Sync Redis click counters back to PostgreSQL's click_count column.
+
+    Redis key pattern: clicks:<short_code>  (set by increment_click_count)
+    """
+    db = SessionLocal()
+    try:
+        # 1. Discover all pending counters
+        keys = redis_client.keys("clicks:*")
+        if not keys:
+            print("No pending click counters to flush.")
+            return
+
+        flushed = 0
+        for key in keys:
+            short_code = key.removeprefix("clicks:")
+
+            # 2. Atomically read-and-delete so we never double-count
+            delta = redis_client.getdel(key)
+            if not delta:
+                continue  # another process beat us to it
+            delta = int(delta)
+
+            # 3. Apply delta to Postgres
+            updated = (
+                db.query(URL)
+                .filter(URL.short_code == short_code)
+                .update({"click_count": URL.click_count + delta})
+            )
+            if updated:
+                flushed += 1
+                print(f"  {short_code}: +{delta} clicks written to DB")
+            else:
+                # short_code was deleted from DB but key lingered in Redis — ignore
+                print(f"  {short_code}: skipped (URL not found in DB)")
+
+        db.commit()
+        print(f"Flushed click counts for {flushed} URL(s).")
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    flush_click_counts()
+```
 
 #### **UPDATED** `app/main.py`
 
 ```python
-from fastapi import FastAPI
-
 from app.routers import urls, analytics
-from app.rate_limiter import RateLimiterMiddleware
-
-app = FastAPI(
-    title="URL Shortener API",
-    description="A production-ready URL shortening service",
-    version="1.0.0",
-)
-
-app.add_middleware(RateLimiterMiddleware)
 
 app.include_router(urls.router)
 app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
 
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
 ```
 
 #### **UPDATED** `tests/test_redirect.py`
 
 ```python
-def test_redirect(client):
-    """Test that short codes redirect to the original URL."""
-    create = client.post("/shorten", json={"url": "https://www.example.com"})
-    short_code = create.json()["short_code"]
-
-    response = client.get(f"/{short_code}", follow_redirects=False)
-    assert response.status_code == 301
-    assert response.headers["location"] == "https://www.example.com/"
-
-
-def test_redirect_not_found(client):
-    """Test 404 for non-existent short codes."""
-    response = client.get("/nonexistent", follow_redirects=False)
-    assert response.status_code == 404
-
-
 def test_click_count_increments(client):
     """Test that clicks are tracked."""
     create = client.post("/shorten", json={"url": "https://www.example.com"})
@@ -2536,10 +2498,6 @@ def test_click_count_increments(client):
     stats = client.get(f"/api/analytics/{short_code}")
     assert stats.json()["click_count"] == 2
 ```
-
-### Custom Aliases & Expiration
-
-Custom aliases and TTL are already handled in the schemas and the shorten endpoint. Here is how expiration cleanup works:
 
 #### Expiration Cleanup Job
 
@@ -2579,80 +2537,24 @@ if __name__ == "__main__":
     deactivate_expired_urls()
 ```
 
-This script is designed to run as a **cron job** or Cloud Scheduler task (e.g., every hour). It queries for active URLs past their expiration, marks them inactive, and evicts them from Redis. Running cleanup as a separate process avoids adding latency to the redirect path. In production, you could schedule this with `Cloud Scheduler → Cloud Run Job` or a Kubernetes CronJob.
+This script is designed to run as a **cron job** or Cloud Scheduler task (e.g., every hour). It queries for active URLs past their expiration, marks them inactive, and evicts them from Redis. Running cleanup as a separate process avoids adding latency to the redirect path. In production, you could schedule this with `Cloud Scheduler -> Cloud Run Job` or a Kubernetes CronJob.
 
-#### GCP Deployment: Cloud Scheduler → Cloud Run Job
-
-**Step 1 — Containerize the cleanup script**
-
-Use the same `Dockerfile` but override the entrypoint for the job:
-
-```dockerfile
-# Dockerfile.cleanup
-FROM python:3.14-slim AS builder
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
-
-FROM python:3.14-slim
-WORKDIR /app
-COPY --from=builder /install /usr/local
-COPY . .
-
-CMD ["python", "-m", "app.cleanup"]
-```
-
-**Step 2 — Push the image to Artifact Registry**
+**Mimic Cron:**
 
 ```bash
-# Create a repository (one-time)
-gcloud artifacts repositories create url-shortener \
-  --repository-format=docker \
-  --location=us-central1
+# Create a URL with negative expiration
+curl -X POST http://localhost:8000/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/expired-test", "expires_in_days": -1}'
 
-# Build and push
-gcloud builds submit \
-  --tag us-central1-docker.pkg.dev/PROJECT_ID/url-shortener/cleanup:latest \
-  -f Dockerfile.cleanup .
+
+cd url
+docker compose exec -w /app api python -m app.cleanup
 ```
 
-**Step 3 — Create a Cloud Run Job**
-
-```bash
-gcloud run jobs create url-cleanup \
-  --image us-central1-docker.pkg.dev/PROJECT_ID/url-shortener/cleanup:latest \
-  --region us-central1 \
-  --set-env-vars DATABASE_URL=postgresql://user:pass@DB_IP:5432/urlshortener,REDIS_URL=redis://REDIS_IP:6379/0 \
-  --vpc-connector my-connector \
-  --max-retries 2 \
-  --task-timeout 300s
 ```
-
-`--vpc-connector` lets the job reach Cloud SQL and Memorystore (Redis) over private IPs. `--max-retries 2` retries on failure. `--task-timeout 300s` kills it if cleanup hangs beyond 5 minutes.
-
-**Step 4 — Schedule it with Cloud Scheduler**
-
-```bash
-# Create a service account for the scheduler
-gcloud iam service-accounts create cleanup-scheduler
-
-# Grant it permission to invoke the Cloud Run job
-gcloud run jobs add-iam-policy-binding url-cleanup \
-  --region us-central1 \
-  --member serviceAccount:cleanup-scheduler@PROJECT_ID.iam.gserviceaccount.com \
-  --role roles/run.invoker
-
-# Create the hourly schedule
-gcloud scheduler jobs create http url-cleanup-schedule \
-  --location us-central1 \
-  --schedule "0 * * * *" \
-  --time-zone "UTC" \
-  --uri "https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/PROJECT_ID/jobs/url-cleanup:run" \
-  --http-method POST \
-  --oauth-service-account-email cleanup-scheduler@PROJECT_ID.iam.gserviceaccount.com
+Deactivated 1 expired URLs.
 ```
-
-`--schedule "0 * * * *"` triggers every hour at minute 0. Cloud Scheduler makes an authenticated HTTP POST to the Cloud Run Jobs API, which spins up a container, runs the cleanup, and shuts down — you pay only for execution time.
 
 ### Build, Run & Verify
 
@@ -2673,10 +2575,14 @@ curl -L http://localhost:8000/<short_code>
 curl -L http://localhost:8000/<short_code>
 curl -L http://localhost:8000/<short_code>
 
-# 3. Check analytics
+# 3. Flush Clicks from Redis to Postgres
+cd url
+docker compose exec -w /app api python -m app.flush_clicks
+
+# 4. Check analytics
 curl http://localhost:8000/api/analytics/<short_code>
 
-# 4. Get detailed click summary
+# 5. Get detailed click summary
 curl http://localhost:8000/api/analytics/<short_code>/summary
 ```
 
@@ -2684,7 +2590,7 @@ curl http://localhost:8000/api/analytics/<short_code>/summary
 
 ```json
 {
-  "short_code": "bXkRzPq",
+  "short_code": "CsWrlrArNQ",
   "original_url": "https://www.example.com/very/long/path",
   "click_count": 3,
   "created_at": "2024-01-15T10:30:00Z",

@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
 from app.routers import urls
+from app.rate_limiter import RateLimiterMiddleware
+
 
 app = FastAPI(
     title="URL Shortener API",
@@ -8,9 +10,11 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.include_router(urls.router)
+app.add_middleware(RateLimiterMiddleware)
 
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+app.include_router(urls.router)

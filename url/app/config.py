@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     short_code_length: int = 7
     default_ttl_days: int = 365
     machine_id: int = 0
+    rate_limit_per_minute: int = 60
 
 
 settings = Settings()

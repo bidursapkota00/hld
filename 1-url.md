@@ -587,12 +587,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(urls.router)
-
-
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+app.include_router(urls.router)
 ```
 
 `include_router` mounts the URL router so the `POST /shorten` endpoint is accessible.
@@ -1389,12 +1388,12 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.include_router(urls.router)
-
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+app.include_router(urls.router)
 ```
 
 #### **UPDATED** `compose.yaml`
@@ -1932,10 +1931,10 @@ Without rate limiting, a single client can overwhelm the service with requests. 
 **Changed files:**
 
 ```
-app/rate_limiter.py      ← NEW
-app/main.py              ← UPDATED
-app/config.py            ← UPDATED
-.env                     ← UPDATED
+app/rate_limiter.py      # NEW
+app/main.py              # UPDATED
+app/config.py            # UPDATED
+.env                     # UPDATED
 ```
 
 #### **UPDATED** `.env`
@@ -1974,7 +1973,8 @@ Added `rate_limit_per_minute`.
 ```python
 import time
 
-from fastapi import HTTPException, Request
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.cache import redis_client
@@ -2004,10 +2004,16 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
         request_count = results[2]
 
         if request_count > settings.rate_limit_per_minute:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=429,
-                detail=f"Rate limit exceeded. Max {settings.rate_limit_per_minute} "
-                       f"requests per minute.",
+                content={
+                    "detail": f"Rate limit exceeded. Max {settings.rate_limit_per_minute} requests per minute."
+                },
+                headers={
+                    "Retry-After": "60",
+                    "X-RateLimit-Limit": str(settings.rate_limit_per_minute),
+                    "X-RateLimit-Remaining": "0",
+                },
             )
 
         response = await call_next(request)
@@ -2036,12 +2042,12 @@ app = FastAPI(
 
 app.add_middleware(RateLimiterMiddleware)
 
-app.include_router(urls.router)
-
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+app.include_router(urls.router)
 ```
 
 ### Build, Run & Verify

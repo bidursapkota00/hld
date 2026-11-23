@@ -2941,9 +2941,10 @@ The HPA watches the metrics-server and adjusts the number of API replicas. When 
 ```bash
 # Point your shell to Minikube's Docker daemon (so builds are available to the cluster)
 eval $(minikube docker-env)
+eval $(minikube docker-env -u) # To undo above command
 
 # Build the image inside Minikube's Docker
-docker build -t url-shortener:latest .
+minikube image build -t url-shortener:latest .
 
 # Apply all manifests
 kubectl apply -f k8s/
@@ -2957,10 +2958,7 @@ kubectl get all -n url-shortener
 ### Access the API
 
 ```bash
-# Get the external URL (Minikube tunnels LoadBalancer services)
-minikube service api -n url-shortener --url
-
-# Or use port-forwarding for quick local access
+# Use port-forwarding for quick local access
 kubectl port-forward svc/api 8000:80 -n url-shortener
 ```
 
@@ -2986,7 +2984,7 @@ kubectl describe hpa api-hpa -n url-shortener
 brew install hey
 
 # Send 1000 requests with 50 concurrent workers
-hey -n 1000 -c 50 http://$(minikube service api -n url-shortener --url | head -1)/health
+hey -n 1000 -c 50 http://localhost:8000/health
 
 # Watch pods scale up in another terminal
 kubectl get pods -n url-shortener --watch

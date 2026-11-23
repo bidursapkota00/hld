@@ -6,3 +6,4 @@ pydantic-settings
 httpx
 pytest
 alembic
+redis

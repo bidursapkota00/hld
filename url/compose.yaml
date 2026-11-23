@@ -6,9 +6,12 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
       - BASE_URL=http://localhost:8000
     depends_on:
       db:
+        condition: service_healthy
+      cache:
         condition: service_healthy
     restart: unless-stopped
 
@@ -28,5 +31,19 @@ services:
       timeout: 5s
       retries: 5
 
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   db-data:
+  redis-data:

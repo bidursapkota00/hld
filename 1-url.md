@@ -1709,14 +1709,15 @@ requirements.txt         # UPDATED
 #### **UPDATED** `requirements.txt`
 
 ```text
-fastapi[standard]==0.115.0
-sqlalchemy==2.0.35
-psycopg2-binary==2.9.10
-python-dotenv==1.0.1
-pydantic-settings==2.5.2
-httpx==0.27.2
-pytest==8.3.3
-redis==5.1.1
+fastapi[standard]
+sqlalchemy
+psycopg[binary]
+python-dotenv
+pydantic-settings
+httpx
+pytest
+alembic
+redis
 ```
 
 #### **UPDATED** `.env`
@@ -1844,9 +1845,9 @@ def delete_cached_url(short_code: str):
     redis_client.delete(f"url:{short_code}")
 
 
-def increment_click_count(short_code: str) -> int:
-    """Atomically increment click count in Redis."""
-    return redis_client.incr(f"clicks:{short_code}")
+# def increment_click_count(short_code: str) -> int:
+#     """Atomically increment click count in Redis."""
+#     return redis_client.incr(f"clicks:{short_code}")
 ```
 
 `redis.from_url` parses the connection string and creates a connection pool automatically. `decode_responses=True` makes Redis return Python strings instead of bytes, avoiding `.decode()` calls everywhere. `setex` sets a key with an expiration time in seconds; after `CACHE_TTL` seconds, Redis automatically deletes the key. The `url:` prefix namespaces cache keys to avoid collisions with other data stored in the same Redis instance. `incr` is atomic, meaning concurrent requests will not lose counts, even without locks.
@@ -1854,74 +1855,7 @@ def increment_click_count(short_code: str) -> int:
 #### **UPDATED** `app/routers/urls.py`
 
 ```python
-import uuid
-from datetime import datetime, timedelta, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
-
-from app.config import settings
-from app.database import get_db
-from app.models import URL
-from app.schemas import URLCreate, URLResponse
-from app.shortener import generate_short_code, is_valid_alias
 from app.cache import get_cached_url, set_cached_url, increment_click_count
-
-router = APIRouter()
-
-
-@router.post("/shorten", response_model=URLResponse, status_code=201)
-def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_db)):
-    """Create a shortened URL."""
-    original_url = str(payload.url)
-
-    # Handle custom alias
-    if payload.custom_alias:
-        if not is_valid_alias(payload.custom_alias):
-            raise HTTPException(
-                status_code=400,
-                detail="Alias must be 3-20 alphanumeric characters.",
-            )
-
-        existing = db.query(URL).filter(URL.short_code == payload.custom_alias).first()
-        if existing:
-            raise HTTPException(status_code=409, detail="Alias already taken.")
-
-        short_code = payload.custom_alias
-    else:
-        short_code = None                     # Will be generated after insert
-
-    # Calculate expiration
-    ttl_days = payload.expires_in_days or settings.default_ttl_days
-    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
-
-    # Create the URL record
-    url_record = URL(
-        short_code=short_code or uuid.uuid4().hex[:8],  # Temporary, replaced below
-        original_url=original_url,
-        expires_at=expires_at,
-        user_ip=request.client.host,
-    )
-
-    db.add(url_record)
-    db.flush()                                # Get the auto-generated ID
-
-    # Generate short code from ID if no custom alias
-    if not payload.custom_alias:
-        url_record.short_code = generate_short_code(url_record.id)
-
-    db.commit()
-    db.refresh(url_record)
-
-    return URLResponse(
-        short_code=url_record.short_code,
-        short_url=f"{settings.base_url}/{url_record.short_code}",
-        original_url=url_record.original_url,
-        created_at=url_record.created_at,
-        expires_at=url_record.expires_at,
-    )
-
 
 @router.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
@@ -1930,10 +1864,12 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     # 1. Check cache first
     cached = get_cached_url(short_code)
     if cached:
-        increment_click_count(short_code)
+        # increment_click_count(short_code)
+        print(f"CACHE HIT: {short_code}")
         return RedirectResponse(url=cached["original_url"], status_code=301)
 
-    # 2. Cache miss → query database
+    # 2. Cache miss then query database
+    print(f"CACHE MISS: {short_code}")
     url_record = db.query(URL).filter(URL.short_code == short_code).first()
 
     if not url_record:
@@ -1958,7 +1894,7 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
     )
 
     # 4. Update count and redirect
-    url_record.click_count += 1
+    # url_record.click_count += 1
     db.commit()
 
     return RedirectResponse(url=url_record.original_url, status_code=301)
@@ -1980,11 +1916,11 @@ curl -X POST http://localhost:8000/shorten \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.example.com"}'
 
-# First redirect — cache miss, hits the DB and populates cache
-curl -v http://localhost:8000/<short_code> 2>&1 | head -20
+# First redirect: cache miss, hits the DB and populates cache
+curl http://localhost:8000/<short_code>
 
-# Second redirect — cache hit, served from Redis (faster)
-curl -v http://localhost:8000/<short_code> 2>&1 | head -20
+# Second redirect: cache hit, served from Redis (faster)
+curl http://localhost:8000/<short_code>
 ```
 
 ---

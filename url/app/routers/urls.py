@@ -9,6 +9,7 @@ from app.database import get_db
 from app.models import URL
 from app.schemas import URLCreate, URLResponse
 from app.shortener import generate_snowflake_code, is_valid_alias
+from app.cache import get_cached_url, set_cached_url, increment_click_count
 
 router = APIRouter()
 
@@ -57,9 +58,20 @@ def shorten_url(payload: URLCreate, request: Request, db: Session = Depends(get_
     )
 
 
+
 @router.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
-    """Redirect a short code to its original URL after checking validity."""
+    """Redirect with Redis cache layer."""
+
+    # 1. Check cache first
+    cached = get_cached_url(short_code)
+    if cached:
+        # increment_click_count(short_code)
+        print(f"CACHE HIT: {short_code}")
+        return RedirectResponse(url=cached["original_url"], status_code=301)
+
+    # 2. Cache miss then query database
+    print(f"CACHE MISS: {short_code}")
     url_record = db.query(URL).filter(URL.short_code == short_code).first()
 
     if not url_record:
@@ -70,12 +82,21 @@ def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get
 
     if url_record.expires_at:
         expires_at = url_record.expires_at
+        # SQLite in test environments strips tzinfo; ensure timezone awareness for comparison
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at < datetime.now(timezone.utc):
             raise HTTPException(status_code=410, detail="This link has expired.")
 
-    return RedirectResponse(
-        url=url_record.original_url,
-        status_code=301,                      # Permanent redirect (cacheable)
+    # 3. Populate cache
+    set_cached_url(
+        short_code,
+        url_record.original_url,
+        url_record.expires_at.isoformat() if url_record.expires_at else None,
     )
+
+    # 4. Update count and redirect
+    # url_record.click_count += 1
+    db.commit()
+
+    return RedirectResponse(url=url_record.original_url, status_code=301)

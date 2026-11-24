@@ -2047,6 +2047,128 @@ The first 20 requests return `200`. Once the burst allowance is exhausted, reque
 429
 ```
 
+### Running Tests Locally (Mocking Redis with fakeredis)
+
+When running tests locally via `pytest`, endpoints attempt to connect to `REDIS_URL=redis://cache:6379/0`. Since `cache` is an internal Docker Compose service hostname, running `pytest` directly on your host machine will fail with `redis.exceptions.ConnectionError` (unknown host `cache`).
+
+Just as SQLite is used in place of PostgreSQL for local testing, you can use `fakeredis` to provide a fast, in-memory Redis instance so your test suite remains completely self-contained and isolated from Docker.
+
+#### 1. Install `fakeredis`
+
+Add `fakeredis` to `requirements.txt`:
+
+```text
+fastapi[standard]
+sqlalchemy
+psycopg[binary]
+python-dotenv
+pydantic-settings
+httpx
+pytest
+alembic
+redis
+fakeredis
+```
+
+Install it into your virtual environment:
+
+```bash
+pip install fakeredis
+```
+
+#### 2. **UPDATED** `tests/conftest.py`
+
+Add an autouse fixture that patches the Redis clients in `app.cache` and `app.rate_limiter` with a `FakeRedis` instance:
+
+```python
+from unittest.mock import patch
+import fakeredis
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.types import BigInteger
+
+
+@compiles(BigInteger, "sqlite")
+def compile_biginteger_sqlite(type_, compiler, **kw):
+    """Compile BigInteger as INTEGER in SQLite so autoincrement ROWID works."""
+    return "INTEGER"
+
+
+from app.database import Base, get_db
+from app.main import app
+
+TEST_DATABASE_URL = "sqlite:///./test.db"
+
+engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
+TestSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+@pytest.fixture(autouse=True)
+def mock_redis():
+    """Mock Redis with an in-memory FakeRedis instance for hermetic tests."""
+    fake = fakeredis.FakeRedis(decode_responses=True)
+    with patch("app.cache.redis_client", fake), patch(
+        "app.rate_limiter.redis_client", fake
+    ):
+        yield fake
+
+
+@pytest.fixture(autouse=True)
+def setup_db():
+    """Create tables before each test, drop them after."""
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def db():
+    """Provide a database session for tests."""
+    session = TestSession()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture
+def client(db):
+    """Override the database dependency with the test database."""
+    def override_get_db():
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+```
+
+#### 3. Run all tests
+
+```bash
+pytest -v
+```
+
+**Expected output:**
+
+```
+tests/test_shorten.py::test_shorten_url PASSED
+tests/test_shorten.py::test_shorten_with_custom_ttl PASSED
+tests/test_shorten.py::test_shorten_with_custom_alias PASSED
+tests/test_shorten.py::test_duplicate_alias_rejected PASSED
+tests/test_shorten.py::test_invalid_alias_rejected PASSED
+tests/test_shorten.py::test_invalid_url_rejected PASSED
+tests/test_redirect.py::test_redirect PASSED
+tests/test_redirect.py::test_redirect_not_found PASSED
+tests/test_redirect.py::test_redirect_expired_url_returns_410 PASSED
+tests/test_redirect.py::test_redirect_deactivated_url_returns_410 PASSED
+```
+
 ---
 
 ## Click Events Model + Analytics

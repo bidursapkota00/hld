@@ -17,9 +17,9 @@
 9. [Snowflake Algorithm](#snowflake-algorithm)
 10. [Expiration](#expiration)
 11. [Caching with Redis](#caching-with-redis)
-12. [Rate Limiting](#rate-limiting)
+12. [Rate Limiting with Nginx](#rate-limiting-with-nginx)
 13. [Click Events Model + Analytics](#click-events-model--analytics)
-14. [Load Balancing with Autoscaling on Kubernetes](#load-balancing-with-autoscaling-on-kubernetes)
+14. [Load Balancing & Production Deployment on GCP Compute Engine](#load-balancing--production-deployment-on-gcp-compute-engine)
 
 ---
 
@@ -1934,148 +1934,132 @@ curl http://localhost:8000/<short_code>
 
 ---
 
-## Rate Limiting
+## Rate Limiting with Nginx
 
-Without rate limiting, a single client can overwhelm the service with requests. We implement a **sliding window** rate limiter using Redis.
+Handling rate limiting inside application code (e.g., Python middleware with Redis) means every abusive or volumetric request still consumes application process time, event loop cycles, and network I/O.
+
+Moving rate limiting to **Nginx** at the reverse proxy layer uses the **leaky bucket algorithm** implemented in C. Malicious or excessive requests are dropped at the network edge with an immediate `429 Too Many Requests` response before they ever reach FastAPI or touch Redis.
 
 **Changed files:**
 
 ```
-app/rate_limiter.py      # NEW
-app/main.py              # UPDATED
-app/config.py            # UPDATED
-.env                     # UPDATED
+nginx/nginx.conf         # NEW
+compose.yaml             # UPDATED
 ```
 
-#### **UPDATED** `.env`
+#### **NEW** `nginx/nginx.conf`
 
-```bash
-DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
-BASE_URL=http://localhost:8000
-REDIS_URL=redis://cache:6379/0
-RATE_LIMIT_PER_MINUTE=60
+```nginx
+events {
+    worker_connections 1024;
+}
+
+http {
+    # 10MB memory zone tracks ~160,000 IPs at a rate limit of 10 requests/second per IP
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+    upstream fastapi_app {
+        server api:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        # Allow bursts of up to 20 requests without delay; excess is dropped with 429
+        limit_req zone=api_limit burst=20 nodelay;
+        limit_req_status 429;
+
+        location / {
+            proxy_pass http://fastapi_app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
 ```
 
-#### **UPDATED** `app/config.py`
+`limit_req_zone` uses `$binary_remote_addr` (only 4 bytes for IPv4 or 16 bytes for IPv6) to minimize memory overhead. The `10m` zone stores approximately 160,000 unique client IP states. `burst=20 nodelay` allows sudden, legitimate bursts while still throttling continuous floods without adding artificial delay to responsive requests. `limit_req_status 429` ensures standard HTTP 429 status is returned instead of Nginx's default 503.
 
-```python
-from pydantic_settings import BaseSettings, SettingsConfigDict
+#### **UPDATED** `compose.yaml`
 
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
+  api:
+    build: .
+    restart: unless-stopped
+    command: sh -c "alembic upgrade head && fastapi run app/main.py --host 0.0.0.0 --port 8000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
+      - BASE_URL=http://localhost
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
 
-    database_url: str = "postgresql://user:pass@localhost:5432/urlshortener"
-    redis_url: str = "redis://localhost:6379/0"
-    base_url: str = "http://localhost:8000"
-    short_code_length: int = 7
-    default_ttl_days: int = 365
-    rate_limit_per_minute: int = 60
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
+  cache:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-settings = Settings()
+volumes:
+  db-data:
+  redis-data:
 ```
 
-Added `rate_limit_per_minute`.
-
-#### **NEW** `app/rate_limiter.py`
-
-```python
-import time
-
-from fastapi import Request
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-
-from app.cache import redis_client
-from app.config import settings
-
-
-class RateLimiterMiddleware(BaseHTTPMiddleware):
-    """Sliding window rate limiter using Redis sorted sets."""
-
-    async def dispatch(self, request: Request, call_next):
-        # Skip rate limiting for health checks
-        if request.url.path == "/health":
-            return await call_next(request)
-
-        client_ip = request.client.host
-        key = f"rate:{client_ip}"
-        now = time.time()
-        window = 60                           # 60-second sliding window
-
-        pipe = redis_client.pipeline()
-        pipe.zremrangebyscore(key, 0, now - window)   # Remove expired entries
-        pipe.zadd(key, {str(now): now})               # Add current request
-        pipe.zcard(key)                               # Count requests in window
-        pipe.expire(key, window)                      # Auto-cleanup key
-        results = pipe.execute()
-
-        request_count = results[2]
-
-        if request_count > settings.rate_limit_per_minute:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": f"Rate limit exceeded. Max {settings.rate_limit_per_minute} requests per minute."
-                },
-                headers={
-                    "Retry-After": "60",
-                    "X-RateLimit-Limit": str(settings.rate_limit_per_minute),
-                    "X-RateLimit-Remaining": "0",
-                },
-            )
-
-        response = await call_next(request)
-        response.headers["X-RateLimit-Limit"] = str(settings.rate_limit_per_minute)
-        response.headers["X-RateLimit-Remaining"] = str(
-            max(0, settings.rate_limit_per_minute - request_count)
-        )
-        return response
-```
-
-A **sliding window** with Redis sorted sets is more accurate than fixed-window counters. Each request timestamp is stored as both the member and score in a sorted set keyed by client IP. `zremrangebyscore` removes entries older than 60 seconds, `zadd` adds the current request, and `zcard` counts the remaining entries. `pipeline()` sends all four commands in a single round trip, reducing latency. The `X-RateLimit-*` response headers inform the client of their remaining quota. `expire` ensures the key is automatically cleaned up even if the client disappears.
-
-#### **UPDATED** `app/main.py`
-
-```python
-from fastapi import FastAPI
-
-from app.routers import urls
-from app.rate_limiter import RateLimiterMiddleware
-
-app = FastAPI(
-    title="URL Shortener API",
-    description="A production-ready URL shortening service",
-    version="1.0.0",
-)
-
-app.add_middleware(RateLimiterMiddleware)
-
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
-
-app.include_router(urls.router)
-```
+The API service port `8000` is removed from external host mapping and stays isolated inside the Docker network. Only Nginx binds to host port `80`.
 
 ### Build, Run & Verify
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
-Demonstrate rate limiting by sending many requests rapidly:
+Test rate limiting by sending 35 rapid requests (rate limit is 10 r/s with a burst allowance of 20):
 
 ```bash
-# Send 65 rapid requests (limit is 60/min)
-for i in $(seq 1 65); do
-  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/health
+for i in $(seq 1 35); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost/health
 done
 ```
 
-The first 60 requests return `200`. Requests 61+ return `429`:
+The first 20 requests return `200`. Once the burst allowance is exhausted, requests return `429`:
 
 **Expected output (last few lines):**
 
@@ -2085,19 +2069,6 @@ The first 60 requests return `200`. Requests 61+ return `429`:
 429
 429
 429
-```
-
-Check the rate limit headers:
-
-```bash
-curl -v http://localhost:8000/health 2>&1 | grep -i x-ratelimit
-```
-
-**Expected output:**
-
-```
-< X-RateLimit-Limit: 60
-< X-RateLimit-Remaining: 59
 ```
 
 ---
@@ -2614,380 +2585,321 @@ curl http://localhost:8000/api/analytics/<short_code>/summary
 
 ---
 
-## Load Balancing with Autoscaling on Kubernetes
+## Load Balancing & Production Deployment on GCP Compute Engine
 
-Kubernetes orchestrates your containers across multiple nodes, automatically distributing traffic and scaling replicas based on demand. This section sets up a local cluster with Minikube, deploys PostgreSQL and Redis as StatefulSets, runs the API as a Deployment behind a Service, and configures a Horizontal Pod Autoscaler (HPA) to scale based on CPU utilization.
+Instead of managing the cost and operational overhead of a Kubernetes cluster (GKE) and managed cloud databases (Cloud SQL, Memorystore) for this single-service workload, we deploy a production-ready, self-hosted stack on a single **GCP Compute Engine (GCE) VM** using Docker Compose and Nginx.
 
-### Prerequisites
+### Cost & Operational Comparison
+
+| Component | Kubernetes + Managed Cloud (GKE + Cloud SQL + Memorystore) | Single GCP VM (Compute Engine + Docker Compose) |
+| :--- | :--- | :--- |
+| **Cluster Management Fee** | ~$74/mo (GKE control plane) | $0 |
+| **Compute / Nodes** | ~$50 - $100/mo (node pool VMs) | ~$25/mo (`e2-medium`, 2 vCPU, 4GB RAM) |
+| **Database** | ~$35 - $100+/mo (Cloud SQL PostgreSQL) | $0 (Self-hosted in Docker container with persistent SSD) |
+| **Cache** | ~$35+/mo (Cloud Memorystore Redis) | $0 (Self-hosted in Docker container) |
+| **Load Balancer** | ~$18+/mo (GCP HTTPS Load Balancer) | $0 (Nginx reverse proxy on port 80/443) |
+| **Total Estimated Cost** | **~$210 - $320+/month** | **~$25/month** |
+
+### CPU & Memory Utilization: Avoiding Waste
+
+When running on a 2 vCPU / 4 GB RAM VM (such as GCP `e2-medium`):
+
+1. **Python GIL & Multi-Instance API:**
+   * Python's Global Interpreter Lock (GIL) limits a single Uvicorn/FastAPI process to **1 CPU core** (100% of 1 vCPU).
+   * A single API instance on a 2-vCPU VM leaves 50% of total VM CPU idle during traffic spikes.
+   * Running **2 API instances** (`api-1` and `api-2`) allows FastAPI to saturate both vCPUs during burst periods while providing fault tolerance.
+2. **Leaving Headroom for Postgres, Redis, and Nginx:**
+   * Running 2 API instances (rather than 4 or 6) ensures that background services (PostgreSQL writing WAL logs, Redis persisting snapshots, and Nginx routing packets) are never starved of CPU cycles.
+3. **Memory Breakdown & Linux Page Cache:**
+   * **FastAPI (2 instances):** ~200 – 300 MB total.
+   * **Nginx:** ~20 MB.
+   * **Redis:** ~50 – 200 MB (100k cached short codes ≈ 50 MB).
+   * **PostgreSQL:** ~300 – 800 MB.
+   * **Total active containers:** ~1.2 – 1.8 GB RAM.
+   * **Unused RAM is NOT wasted:** The Linux kernel automatically claims all remaining free RAM as **Page Cache**, caching PostgreSQL table data and indexes directly in memory. Disk reads from persistent storage drop to near zero.
+
+### The Database Migration Challenge
+
+Running multiple API instances in Docker Compose introduces a potential race condition: if both `api-1` and `api-2` boot simultaneously and execute `alembic upgrade head`, they can collide on database locks.
+
+To solve this, we extract database migrations into a lightweight, one-off **`migration` service** that runs `alembic upgrade head` once before any API instance starts.
+
+### Architecture
+
+```
+                 Internet (HTTP/HTTPS: 80, 443)
+                               │
+                               ▼
+                ┌──────────────────────────────┐
+                │    GCP Compute Engine VM     │
+                │                              │
+                │  ┌────────────────────────┐  │
+                │  │         Nginx          │  │ (Rate limit, SSL, Least-Conn LB)
+                │  └───────┬──────────┬─────┘  │
+                │          │          │        │
+                │    ┌─────▼────┐ ┌───▼──────┐ │
+                │    │  api-1   │ │  api-2   │ │ (FastAPI Uvicorn instances)
+                │    └─────┬────┘ └───┬──────┘ │
+                │          │          │        │
+                │  ┌───────▼──────────▼─────┐  │
+                │  │  Redis     PostgreSQL  │  │ (Containers with persistent volumes)
+                │  └────────────────────────┘  │
+                └──────────────────────────────┘
+```
+
+**Changed files:**
+
+```
+nginx/nginx.conf         # UPDATED
+compose.yaml             # UPDATED
+```
+
+#### **UPDATED** `nginx/nginx.conf`
+
+```nginx
+events {
+    worker_connections 1024;
+}
+
+http {
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+    upstream fastapi_cluster {
+        least_conn; # Distribute requests to the instance with fewest active connections
+        server api-1:8000 max_fails=3 fail_timeout=10s;
+        server api-2:8000 max_fails=3 fail_timeout=10s;
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        limit_req zone=api_limit burst=20 nodelay;
+        limit_req_status 429;
+
+        location / {
+            proxy_pass http://fastapi_cluster;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Automatically retry next instance if one fails or times out
+            proxy_next_upstream error timeout http_500 http_502 http_503;
+        }
+    }
+}
+```
+
+* `least_conn`: Forwards incoming connections to the backend instance with the smallest number of active requests, preventing one container from being overloaded by slow requests.
+* `proxy_next_upstream`: Automatically re-routes requests to the other replica if an API instance throws a 500, 502, 503, or times out.
+
+#### **UPDATED** `compose.yaml`
+
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+
+  # One-off migration runner to prevent Alembic lock contention
+  migration:
+    build: .
+    command: alembic upgrade head
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api-1:
+    build: .
+    restart: unless-stopped
+    command: fastapi run app/main.py --host 0.0.0.0 --port 8000
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
+      - BASE_URL=http://localhost
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      cache:
+        condition: service_healthy
+
+  api-2:
+    build: .
+    restart: unless-stopped
+    command: fastapi run app/main.py --host 0.0.0.0 --port 8000
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
+      - BASE_URL=http://localhost
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      cache:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
+  redis-data:
+```
+
+### Deploying to GCP Compute Engine
+
+#### 1. Provision the VM
+
+Use `gcloud` or the GCP Console to create an `e2-medium` instance:
 
 ```bash
-# Install Minikube and kubectl
-brew install minikube kubectl
-
-# Start a local cluster
-minikube start --cpus=4 --memory=4096
-
-# Enable the metrics-server addon (required for HPA)
-minikube addons enable metrics-server
-
-# Enable the ingress addon (optional, for local domain routing)
-minikube addons enable ingress
-
-# Verify the cluster is running
-kubectl cluster-info
-kubectl get nodes
+gcloud compute instances create url-shortener-vm \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --boot-disk-size=30GB \
+    --boot-disk-type=pd-balanced \
+    --tags=http-server,https-server \
+    --image-family=ubuntu-2404-lts-amd64 \
+    --image-project=ubuntu-os-cloud
 ```
 
-`minikube start` creates a single-node Kubernetes cluster inside a VM or container on your machine. `metrics-server` collects CPU and memory usage from each pod, which the HPA reads to decide when to scale. Without it, `kubectl top pods` and autoscaling won't work.
-
-### Namespace
+Ensure the default VPC firewall allows inbound traffic on port 80 and 443:
 
 ```bash
-kubectl create namespace url-shortener
+gcloud compute firewall-rules create allow-http-https \
+    --direction=INGRESS \
+    --priority=1000 \
+    --network=default \
+    --action=ALLOW \
+    --rules=tcp:80,tcp:443 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=http-server,https-server
 ```
 
-Namespaces isolate resources logically within a cluster. All manifests below use `namespace: url-shortener` so the entire application can be managed or torn down as a unit with `kubectl delete namespace url-shortener`.
+#### 2. Install Docker & Docker Compose on the VM
 
-### ConfigMap & Secrets
-
-```yaml
-# k8s/configmap.yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: api-config
-  namespace: url-shortener
-data:
-  BASE_URL: "http://localhost:8000"
-  SHORT_CODE_LENGTH: "7"
-  DEFAULT_TTL_DAYS: "365"
-  RATE_LIMIT_PER_MINUTE: "60"
-```
-
-```yaml
-# k8s/secret.yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: db-secret
-  namespace: url-shortener
-type: Opaque
-stringData:
-  POSTGRES_USER: user
-  POSTGRES_PASSWORD: pass
-  POSTGRES_DB: urlshortener
-  DATABASE_URL: "postgresql://user:pass@postgres:5432/urlshortener"
-  REDIS_URL: "redis://redis:6379/0"
-```
+SSH into the newly created VM:
 
 ```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
+gcloud compute ssh url-shortener-vm --zone=us-central1-a
 ```
 
-ConfigMaps hold non-sensitive configuration; Secrets hold credentials. Both are injected into pods as environment variables. In production, use an external secret manager (GCP Secret Manager, HashiCorp Vault) and reference secrets via the `ExternalSecret` CRD instead of storing them in YAML files.
-
-### PostgreSQL StatefulSet
-
-```yaml
-# k8s/postgres.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: postgres
-  namespace: url-shortener
-spec:
-  clusterIP: None # Headless service for stable DNS
-  selector:
-    app: postgres
-  ports:
-    - port: 5432
-      targetPort: 5432
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: postgres
-  namespace: url-shortener
-spec:
-  serviceName: postgres
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgres
-  template:
-    metadata:
-      labels:
-        app: postgres
-    spec:
-      containers:
-        - name: postgres
-          image: postgres:16
-          ports:
-            - containerPort: 5432
-          envFrom:
-            - secretRef:
-                name: db-secret
-          volumeMounts:
-            - name: postgres-data
-              mountPath: /var/lib/postgresql/data
-          readinessProbe:
-            exec:
-              command: ["pg_isready", "-U", "user", "-d", "urlshortener"]
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 250m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-  volumeClaimTemplates:
-    - metadata:
-        name: postgres-data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 1Gi
-```
-
-A StatefulSet (not a Deployment) is used because databases need stable network identities and persistent storage. The headless Service (`clusterIP: None`) gives each pod a stable DNS name (`postgres-0.postgres.url-shortener.svc.cluster.local`). `volumeClaimTemplates` creates a PersistentVolumeClaim for each replica, so data survives pod restarts. The `readinessProbe` uses `pg_isready` — the same utility from the Docker Compose health check — to ensure traffic is only routed to the pod after PostgreSQL is ready.
-
-### Redis StatefulSet
-
-```yaml
-# k8s/redis.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-  namespace: url-shortener
-spec:
-  clusterIP: None
-  selector:
-    app: redis
-  ports:
-    - port: 6379
-      targetPort: 6379
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: redis
-  namespace: url-shortener
-spec:
-  serviceName: redis
-  replicas: 1
-  selector:
-    matchLabels:
-      app: redis
-  template:
-    metadata:
-      labels:
-        app: redis
-    spec:
-      containers:
-        - name: redis
-          image: redis:7-alpine
-          command: ["redis-server", "--appendonly", "yes"]
-          ports:
-            - containerPort: 6379
-          volumeMounts:
-            - name: redis-data
-              mountPath: /data
-          readinessProbe:
-            exec:
-              command: ["redis-cli", "ping"]
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 250m
-              memory: 256Mi
-  volumeClaimTemplates:
-    - metadata:
-        name: redis-data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 500Mi
-```
-
-Same pattern as PostgreSQL: a headless Service for stable DNS and a PersistentVolumeClaim for AOF persistence. The `redis-cli ping` readiness probe mirrors the Docker Compose health check.
-
-### API Deployment
-
-```yaml
-# k8s/api-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api
-  namespace: url-shortener
-spec:
-  replicas: 2 # Start with 2 replicas
-  selector:
-    matchLabels:
-      app: api
-  template:
-    metadata:
-      labels:
-        app: api
-    spec:
-      containers:
-        - name: api
-          image: url-shortener:latest
-          imagePullPolicy: IfNotPresent # Use local Minikube image
-          ports:
-            - containerPort: 8000
-          envFrom:
-            - configMapRef:
-                name: api-config
-            - secretRef:
-                name: db-secret
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            failureThreshold: 3
-          resources:
-            requests:
-              cpu: 250m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-```
-
-Unlike the databases, the API is stateless and uses a **Deployment**, which supports rolling updates and horizontal scaling. The `readinessProbe` checks `/health` before routing traffic to a new pod — this prevents sending requests to pods that haven't connected to PostgreSQL or Redis yet. The `livenessProbe` restarts a pod if it becomes unresponsive (3 consecutive failures). `imagePullPolicy: IfNotPresent` tells Kubernetes to use the image from Minikube's local Docker daemon instead of pulling from a remote registry.
-
-### API Service
-
-```yaml
-# k8s/api-service.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: api
-  namespace: url-shortener
-spec:
-  type: LoadBalancer # NodePort on Minikube
-  selector:
-    app: api
-  ports:
-    - port: 80
-      targetPort: 8000
-      protocol: TCP
-```
-
-The Service is the stable network endpoint for the API pods. `type: LoadBalancer` provisions an external IP on cloud providers; on Minikube, it falls back to a NodePort. The Service distributes traffic across all pods matching `app: api` using round-robin by default. Kubernetes automatically updates the endpoint list as pods scale up/down or restart.
-
-### Horizontal Pod Autoscaler (HPA)
-
-```yaml
-# k8s/hpa.yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: api-hpa
-  namespace: url-shortener
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: api
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 60
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 30 # React quickly to spikes
-      policies:
-        - type: Pods
-          value: 2
-          periodSeconds: 60 # Add up to 2 pods per minute
-    scaleDown:
-      stabilizationWindowSeconds: 300 # Wait 5 min before scaling down
-      policies:
-        - type: Pods
-          value: 1
-          periodSeconds: 60 # Remove 1 pod per minute
-```
-
-The HPA watches the metrics-server and adjusts the number of API replicas. When average CPU across all pods exceeds 60%, it adds pods (up to 10). When load drops, it removes pods (down to 2). The `behavior` section prevents flapping: scale-up has a short 30-second window to react quickly to traffic spikes, while scale-down waits 5 minutes to avoid premature removal during intermittent load dips.
-
-### Build & Deploy
+Install Docker and the Compose plugin:
 
 ```bash
-# Point your shell to Minikube's Docker daemon (so builds are available to the cluster)
-eval $(minikube docker-env)
-eval $(minikube docker-env -u) # To undo above command
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Build the image inside Minikube's Docker
-minikube image build -t url-shortener:latest .
+echo \
+  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# Apply all manifests
-kubectl apply -f k8s/
-
-# Verify everything is running
-kubectl get all -n url-shortener
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER
 ```
 
-`eval $(minikube docker-env)` redirects `docker build` to Minikube's internal Docker daemon. This avoids pushing images to a registry — Kubernetes pods can pull `url-shortener:latest` directly from the local daemon.
+Log out and back in for group permissions to take effect.
 
-### Access the API
+#### 3. Clone Repository and Start Services
 
 ```bash
-# Use port-forwarding for quick local access
-kubectl port-forward svc/api 8000:80 -n url-shortener
+git clone <your-repository-url>
+cd <your-repository-url>/url
+
+# Start all services detached
+docker compose up -d --build
 ```
 
-`minikube service` creates a tunnel and prints the accessible URL. `port-forward` maps `localhost:8000` directly to the Service, useful for development without exposing a node port.
-
-### Monitor Autoscaling
+Verify that all containers are healthy and running:
 
 ```bash
-# Watch HPA status (shows current/target CPU and replica count)
-kubectl get hpa -n url-shortener --watch
-
-# View pod CPU and memory usage
-kubectl top pods -n url-shortener
-
-# Check pod events and scaling decisions
-kubectl describe hpa api-hpa -n url-shortener
+docker compose ps
 ```
 
-### Load Test to Trigger Autoscaling
+**Expected output:**
+
+```
+NAME                    IMAGE               COMMAND                  SERVICE      STATUS                    PORTS
+url-cache-1             redis:7-alpine      "docker-entrypoint.s…"   cache        Up (healthy)              6379/tcp
+url-db-1                postgres:16         "docker-entrypoint.s…"   db           Up (healthy)              5432/tcp
+url-migration-1         url-migration       "alembic upgrade head"   migration    Exited (0)
+url-api-1-1             url-api-1           "fastapi run app/mai…"   api-1        Up                        8000/tcp
+url-api-2-1             url-api-2           "fastapi run app/mai…"   api-2        Up                        8000/tcp
+url-nginx-1             nginx:alpine        "/docker-entrypoint.…"   nginx        Up                        0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+```
+
+### Zero-Downtime Rolling Restarts
+
+When deploying new code updates on the VM, you can restart one API container at a time without dropping requests:
+
+```bash
+# Pull new changes and rebuild images
+git pull
+docker compose build api-1 api-2
+
+# Restart instance 1 while instance 2 serves traffic
+docker compose restart api-1
+
+# Wait a few seconds for instance 1 to be ready, then restart instance 2
+sleep 5
+docker compose restart api-2
+```
+
+Nginx automatically routes active traffic to the remaining healthy container during each step.
+
+### Load Testing Load Distribution
 
 ```bash
 # Install hey (HTTP load generator)
 brew install hey
 
-# Send 1000 requests with 50 concurrent workers
-hey -n 1000 -c 50 http://localhost:8000/health
-
-# Watch pods scale up in another terminal
-kubectl get pods -n url-shortener --watch
+# Send 2,000 requests with 50 concurrent workers against the VM external IP
+hey -n 2000 -c 50 http://<VM_EXTERNAL_IP>/health
 ```
 
-Under load, you'll see the HPA increase the replica count as CPU crosses the 60% threshold. After the load stops, pods scale back down after the 5-minute stabilization window.
+In another terminal, tail the logs for both API containers:
+
+```bash
+docker compose logs -f api-1 api-2
+```
+
+You will see Nginx distributing incoming HTTP requests evenly across both `api-1` and `api-2`, saturating both CPU cores while maintaining low latency.

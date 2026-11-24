@@ -20,6 +20,7 @@
 12. [Rate Limiting with Nginx](#rate-limiting-with-nginx)
 13. [Click Events Model + Analytics](#click-events-model--analytics)
 14. [Load Balancing & Production Deployment on GCP Compute Engine](#load-balancing--production-deployment-on-gcp-compute-engine)
+15. [Always Free Cloud Deployment on Oracle Cloud Infrastructure (OCI)](#always-free-cloud-deployment-on-oracle-cloud-infrastructure-oci)
 
 ---
 
@@ -2591,32 +2592,32 @@ Instead of managing the cost and operational overhead of a Kubernetes cluster (G
 
 ### Cost & Operational Comparison
 
-| Component | Kubernetes + Managed Cloud (GKE + Cloud SQL + Memorystore) | Single GCP VM (Compute Engine + Docker Compose) |
-| :--- | :--- | :--- |
-| **Cluster Management Fee** | ~$74/mo (GKE control plane) | $0 |
-| **Compute / Nodes** | ~$50 - $100/mo (node pool VMs) | ~$25/mo (`e2-medium`, 2 vCPU, 4GB RAM) |
-| **Database** | ~$35 - $100+/mo (Cloud SQL PostgreSQL) | $0 (Self-hosted in Docker container with persistent SSD) |
-| **Cache** | ~$35+/mo (Cloud Memorystore Redis) | $0 (Self-hosted in Docker container) |
-| **Load Balancer** | ~$18+/mo (GCP HTTPS Load Balancer) | $0 (Nginx reverse proxy on port 80/443) |
-| **Total Estimated Cost** | **~$210 - $320+/month** | **~$25/month** |
+| Component                  | Kubernetes + Managed Cloud (GKE + Cloud SQL + Memorystore) | Single GCP VM (Compute Engine + Docker Compose)          |
+| :------------------------- | :--------------------------------------------------------- | :------------------------------------------------------- |
+| **Cluster Management Fee** | ~$74/mo (GKE control plane)                                | $0                                                       |
+| **Compute / Nodes**        | ~$50 - $100/mo (node pool VMs)                             | ~$25/mo (`e2-medium`, 2 vCPU, 4GB RAM)                   |
+| **Database**               | ~$35 - $100+/mo (Cloud SQL PostgreSQL)                     | $0 (Self-hosted in Docker container with persistent SSD) |
+| **Cache**                  | ~$35+/mo (Cloud Memorystore Redis)                         | $0 (Self-hosted in Docker container)                     |
+| **Load Balancer**          | ~$18+/mo (GCP HTTPS Load Balancer)                         | $0 (Nginx reverse proxy on port 80/443)                  |
+| **Total Estimated Cost**   | **~$210 - $320+/month**                                    | **~$25/month**                                           |
 
 ### CPU & Memory Utilization: Avoiding Waste
 
 When running on a 2 vCPU / 4 GB RAM VM (such as GCP `e2-medium`):
 
 1. **Python GIL & Multi-Instance API:**
-   * Python's Global Interpreter Lock (GIL) limits a single Uvicorn/FastAPI process to **1 CPU core** (100% of 1 vCPU).
-   * A single API instance on a 2-vCPU VM leaves 50% of total VM CPU idle during traffic spikes.
-   * Running **2 API instances** (`api-1` and `api-2`) allows FastAPI to saturate both vCPUs during burst periods while providing fault tolerance.
+   - Python's Global Interpreter Lock (GIL) limits a single Uvicorn/FastAPI process to **1 CPU core** (100% of 1 vCPU).
+   - A single API instance on a 2-vCPU VM leaves 50% of total VM CPU idle during traffic spikes.
+   - Running **2 API instances** (`api-1` and `api-2`) allows FastAPI to saturate both vCPUs during burst periods while providing fault tolerance.
 2. **Leaving Headroom for Postgres, Redis, and Nginx:**
-   * Running 2 API instances (rather than 4 or 6) ensures that background services (PostgreSQL writing WAL logs, Redis persisting snapshots, and Nginx routing packets) are never starved of CPU cycles.
+   - Running 2 API instances (rather than 4 or 6) ensures that background services (PostgreSQL writing WAL logs, Redis persisting snapshots, and Nginx routing packets) are never starved of CPU cycles.
 3. **Memory Breakdown & Linux Page Cache:**
-   * **FastAPI (2 instances):** ~200 – 300 MB total.
-   * **Nginx:** ~20 MB.
-   * **Redis:** ~50 – 200 MB (100k cached short codes ≈ 50 MB).
-   * **PostgreSQL:** ~300 – 800 MB.
-   * **Total active containers:** ~1.2 – 1.8 GB RAM.
-   * **Unused RAM is NOT wasted:** The Linux kernel automatically claims all remaining free RAM as **Page Cache**, caching PostgreSQL table data and indexes directly in memory. Disk reads from persistent storage drop to near zero.
+   - **FastAPI (2 instances):** ~200 – 300 MB total.
+   - **Nginx:** ~20 MB.
+   - **Redis:** ~50 – 200 MB (100k cached short codes ≈ 50 MB).
+   - **PostgreSQL:** ~300 – 800 MB.
+   - **Total active containers:** ~1.2 – 1.8 GB RAM.
+   - **Unused RAM is NOT wasted:** The Linux kernel automatically claims all remaining free RAM as **Page Cache**, caching PostgreSQL table data and indexes directly in memory. Disk reads from persistent storage drop to near zero.
 
 ### The Database Migration Challenge
 
@@ -2691,8 +2692,8 @@ http {
 }
 ```
 
-* `least_conn`: Forwards incoming connections to the backend instance with the smallest number of active requests, preventing one container from being overloaded by slow requests.
-* `proxy_next_upstream`: Automatically re-routes requests to the other replica if an API instance throws a 500, 502, 503, or times out.
+- `least_conn`: Forwards incoming connections to the backend instance with the smallest number of active requests, preventing one container from being overloaded by slow requests.
+- `proxy_next_upstream`: Automatically re-routes requests to the other replica if an API instance throws a 500, 502, 503, or times out.
 
 #### **UPDATED** `compose.yaml`
 
@@ -2903,3 +2904,459 @@ docker compose logs -f api-1 api-2
 ```
 
 You will see Nginx distributing incoming HTTP requests evenly across both `api-1` and `api-2`, saturating both CPU cores while maintaining low latency.
+
+---
+
+## Always Free Cloud Deployment on Oracle Cloud Infrastructure (OCI)
+
+While Google Cloud Platform (GCP) or AWS offer limited trial credits, Oracle Cloud Infrastructure (OCI) provides an industry-leading Always Free Tier featuring up to 4 OCPU cores, 24 GB of RAM (Ampere A1 ARM64), and 200 GB of NVMe block storage at $0/month indefinitely.
+
+By provisioning a 2 OCPU / 12 GB RAM Ampere VM, you get a powerful, dedicated Linux cloud server capable of running the entire URL shortener production stack (Nginx, FastAPI replicas, PostgreSQL, Redis, and full Prometheus/Grafana monitoring) with zero recurring cloud bills.
+
+### Recommended Architecture
+
+```
+                    Internet (HTTP: 80 / HTTPS: 443)
+                                  │
+                                  ▼
+                     [ Public IP + DNS Record ]
+                                  │
+                                  ▼
+       ┌──────────────────────────────────────────────────────────────┐
+       │         Oracle Cloud Always Free Ampere A1 VM                │
+       │               (2 OCPU / 12 GB RAM / ARM64)                   │
+       │                                                              │
+       │   ┌──────────────────────────────────────────────────────┐   │
+       │   │                    Nginx                             │   │
+       │   │     (Reverse Proxy, Rate Limiting, Let's Encrypt SSL)│   │
+       │   └───────────────┬──────────────────────┬───────────────┘   │
+       │                   │                      │                   │
+       │           ┌───────▼────────┐     ┌───────▼────────┐          │
+       │           │  api-1 (8000)  │     │  api-2 (8000)  │          │
+       │           │ FastAPI Docker │     │ FastAPI Docker │          │
+       │           └───────┬────────┘     └───────┬────────┘          │
+       │                   │                      │                   │
+       │           ┌───────▼──────────────────────▼───────┐           │
+       │           │             Docker Network           │           │
+       │           └───────┬──────────────────────┬───────┘           │
+       │                   │                      │                   │
+       │           ┌───────▼────────┐     ┌───────▼────────┐          │
+       │           │   PostgreSQL   │     │     Redis      │          │
+       │           │  (Docker Vol)  │     │  (Docker Vol)  │          │
+       │           └────────────────┘     └────────────────┘          │
+       │                                                              │
+       │   ┌──────────────────────────────────────────────────────┐   │
+       │   │              Monitoring & Observability              │   │
+       │   │        Prometheus (9090)  +  Grafana (3000)          │   │
+       │   └──────────────────────────────────────────────────────┘   │
+       └──────────────────────────────────────────────────────────────┘
+```
+
+You can run this architecture using Docker Compose or experiment with K3s (lightweight Kubernetes), automated GitHub Actions CI/CD, and additional microservices without exceeding free limits.
+
+---
+
+### Step 1: Creating the Always Free Infrastructure
+
+#### 1. Check Your Home Region
+
+Always Free compute shapes (`VM.Standard.A1.Flex`) and Always Free block volumes must be created in your account's Home Region. Verify your home region in the top-right corner of the [OCI Cloud Console](https://cloud.oracle.com/) before proceeding.
+
+#### 2. Create Virtual Cloud Network (VCN)
+
+1. Go to **Networking** > **Virtual Cloud Networks**.
+2. Click **Start VCN Wizard** > **Create VCN with Internet Connectivity** > **Start VCN Wizard**.
+3. Name your VCN (e.g., `url-shortener-vcn`), leave the default CIDRs (`10.0.0.0/16`), and click **Next** > **Create**.
+
+#### 3. Configure Security List (Open Ingress Ports)
+
+To allow external HTTP, HTTPS, and monitoring traffic:
+
+1. In your VCN, click **Security Lists** > **Default Security List for url-shortener-vcn**.
+2. Under **Ingress Rules**, click **Add Ingress Rules**:
+
+| Source CIDR | IP Protocol | Destination Port Range | Description                                       |
+| :---------- | :---------- | :--------------------- | :------------------------------------------------ |
+| `0.0.0.0/0` | TCP         | `22`                   | SSH access (already present)                      |
+| `0.0.0.0/0` | TCP         | `80`                   | HTTP traffic (Nginx & ACME challenges)            |
+| `0.0.0.0/0` | TCP         | `443`                  | HTTPS encrypted web traffic                       |
+| `0.0.0.0/0` | TCP         | `3000`                 | Grafana dashboard (optional: restrict to your IP) |
+| `0.0.0.0/0` | TCP         | `6443`                 | K3s Kubernetes API (optional: only if using K3s)  |
+
+#### 4. Launch the Ampere A1 Compute Instance
+
+1. Go to **Compute** > **Instances** > **Create Instance**.
+2. **Name**: `url-shortener-ampere`.
+3. **Placement**: Select an Availability Domain (e.g., `AD-1`).
+4. **Image and Shape**:
+   - Click **Change Image** > Select **Ubuntu 24.04 Minimal** or **Ubuntu 24.04 LTS** (ensure **Canonical Ubuntu** is selected).
+   - Click **Change Shape** > Choose **Ampere (Arm-based Processor)** > Select **VM.Standard.A1.Flex**.
+   - Configure:
+     - **Number of OCPUs**: `2`
+     - **Amount of memory (GB)**: `12`
+   - _(Note: Always Free allows up to 4 OCPUs and 24 GB RAM total across your account. 2 OCPU / 12 GB RAM leaves room for a second instance or staging environment)._
+5. **Networking**: Select your VCN and public subnet. Ensure **Assign a public IPv4 address** is checked.
+6. **Add SSH Keys**: Select **Upload public key files (.pub)** or paste your local SSH public key (`cat ~/.ssh/id_rsa.pub` or `~/.ssh/id_ed25519.pub`).
+7. **Boot Volume**: Set boot volume to `50 GB` or up to `100 GB` (within your 200 GB Always Free limit).
+8. Click **Create**.
+
+_(Optional OCI CLI command alternative):_
+
+```bash
+oci compute instance launch \
+  --availability-domain "<AVAILABILITY_DOMAIN>" \
+  --compartment-id "<COMPARTMENT_OCID>" \
+  --shape "VM.Standard.A1.Flex" \
+  --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+  --image-id "<UBUNTU_ARM64_IMAGE_OCID>" \
+  --subnet-id "<SUBNET_OCID>" \
+  --assign-public-ip true \
+  --ssh-authorized-keys-file ~/.ssh/id_rsa.pub \
+  --display-name "url-shortener-ampere"
+```
+
+Once the instance turns **RUNNING**, note its **Public IP address**.
+
+---
+
+### Step 2: Server Setup & Resolving the OCI Host Firewall Gotcha
+
+Connect to your instance via SSH:
+
+```bash
+ssh -i ~/.ssh/id_rsa ubuntu@<YOUR_OCI_PUBLIC_IP>
+```
+
+#### The OCI Host Firewall Trap (Crucial)
+
+Oracle's default Ubuntu and Oracle Linux cloud images include pre-configured `iptables` rules that reject inbound connections on ports other than port 22—**even if you opened ports 80 and 443 in the OCI VCN Security List**.
+
+To permit incoming HTTP, HTTPS, and Grafana traffic on the host OS:
+
+```bash
+# Insert ACCEPT rules before the final REJECT rule in iptables
+sudo iptables -I INPUT 6 -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 6 -p tcp --dport 3000 -j ACCEPT
+
+# Persist iptables rules across reboots
+sudo apt-get install -y iptables-persistent netfilter-persistent
+sudo netfilter-persistent save
+```
+
+Or if your image uses `ufw`:
+
+```bash
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 3000/tcp
+sudo ufw enable
+```
+
+---
+
+### Step 3: Installing Docker & Verifying ARM64 Architecture
+
+The Ampere instance runs on the **ARM64 (`aarch64`)** CPU architecture. Docker natively supports ARM64 on Linux.
+
+#### 1. Verify ARM64 Architecture
+
+```bash
+uname -m
+# Expected output: aarch64
+```
+
+#### 2. Install Docker Engine & Docker Compose Plugin
+
+```bash
+# Update package indices and install prerequisites
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg git
+
+# Add Docker's official GPG key
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Set up the Docker repository for arm64
+echo \
+  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker packages
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Grant current user non-root access to docker
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+Verify Docker works:
+
+```bash
+docker run --rm hello-world
+```
+
+---
+
+### Step 4: Deploying the Full Stack with Monitoring
+
+Clone your repository onto the Ampere VM:
+
+```bash
+git clone <your-repository-url>
+cd <your-repository-url>/url
+```
+
+#### 1. Prometheus Configuration (`prometheus/prometheus.yml`)
+
+Create a lightweight configuration to scrape metrics from the FastAPI instances:
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "fastapi"
+    static_configs:
+      - targets: ["api-1:8000", "api-2:8000"]
+```
+
+#### 2. Complete Production Docker Compose (`compose.prod.yaml`)
+
+This compose file integrates Nginx, two FastAPI workers, PostgreSQL, Redis, Prometheus, and Grafana:
+
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - web-root:/var/www/html
+    depends_on:
+      - api-1
+      - api-2
+
+  # Certbot companion for automated SSL certificates
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - web-root:/var/www/html
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12d & wait $${!}; done;'"
+
+  migration:
+    build: .
+    command: alembic upgrade head
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api-1:
+    build: .
+    restart: unless-stopped
+    command: fastapi run app/main.py --host 0.0.0.0 --port 8000
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
+      - BASE_URL=http://<YOUR_DOMAIN_OR_OCI_IP>
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      cache:
+        condition: service_healthy
+
+  api-2:
+    build: .
+    restart: unless-stopped
+    command: fastapi run app/main.py --host 0.0.0.0 --port 8000
+    environment:
+      - DATABASE_URL=postgresql://user:pass@db:5432/urlshortener
+      - REDIS_URL=redis://cache:6379/0
+      - BASE_URL=http://<YOUR_DOMAIN_OR_OCI_IP>
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      cache:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=urlshortener
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  db-data:
+  redis-data:
+  certbot-etc:
+  certbot-var:
+  web-root:
+  prometheus-data:
+  grafana-data:
+```
+
+#### 3. Launch the Stack
+
+```bash
+docker compose -f compose.prod.yaml up -d --build
+```
+
+Verify status:
+
+```bash
+docker compose -f compose.prod.yaml ps
+```
+
+All standard Docker images (`postgres:16-alpine`, `redis:7-alpine`, `nginx:alpine`, `prom/prometheus`, `grafana/grafana`, `python:3.14-slim`) provide multi-architecture manifests and build and run seamlessly on ARM64.
+
+---
+
+### Step 5: Experimenting with Kubernetes using K3s
+
+Because your Ampere instance has **12 GB of RAM and 2 OCPUs**, it easily supports a full Kubernetes control plane and worker node using **K3s** (a lightweight CNCF-certified Kubernetes distribution that requires less than 512 MB RAM).
+
+#### 1. Install K3s on the VM
+
+```bash
+curl -sfL https://get.k3s.io | sh -
+sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+```
+
+Verify the node is ready:
+
+```bash
+kubectl get nodes -o wide
+# You will see the node running architecture arm64 with STATUS Ready
+```
+
+#### 2. Deploy the Existing URL Shortener Manifests
+
+Use the Kubernetes manifests located in `url/k8s/`:
+
+```bash
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/postgres.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/api-deployment.yaml
+kubectl apply -f k8s/api-service.yaml
+kubectl apply -f k8s/hpa.yaml
+```
+
+Check the running pods:
+
+```bash
+kubectl get pods
+```
+
+With K3s and Kubernetes Horizontal Pod Autoscaler (HPA), your URL shortener can scale pods dynamically based on CPU/memory usage right on your free VM.
+
+---
+
+### Step 6: Important Limitations & Workarounds
+
+While Oracle's Always Free Tier is exceptionally generous, keep these critical constraints in mind:
+
+#### 1. Home Region Constraint
+
+- Always Free compute instances and boot volumes **must** be created in your account's designated **Home Region**. You cannot provision Always Free resources in secondary subscribed regions.
+
+#### 2. Capacity ("Out of host capacity")
+
+- Because the Ampere A1 (ARM64) shape is free and high-spec, certain regions experience high demand and may return an `Out of host capacity` error during launch.
+- **Solutions**:
+  1. Try selecting a different Availability Domain (e.g., AD-2 or AD-3 if available in your region).
+  2. Upgrade your account to **Pay-As-You-Go (PAYG)**. Upgrading requires a payment card verification, but **you are never billed as long as your usage stays within Always Free limits**. PAYG accounts receive significantly higher allocation priority over standard free trial accounts.
+  3. Use an automated retry script with the OCI CLI that attempts creation every few minutes until host capacity opens up.
+
+#### 3. Idle Instance Reclamation Policy
+
+- Oracle Cloud automatically flags and reclaims Always Free compute instances if they are deemed **idle** for 7 consecutive days. An instance is considered idle if:
+  - CPU utilization is less than 20% for 95% of the time over 7 days.
+  - Network utilization is less than 20%.
+  - Memory utilization is less than 20% (for A1 shapes).
+- **Prevention**:
+  - Running our recommended stack (2 FastAPI replicas, PostgreSQL, Redis, Prometheus scraping every 15s, and Grafana) naturally generates background activity.
+  - Set up a recurring cron job or health check pinging your service every 5 minutes.
+  - Pay-As-You-Go accounts are exempt from idle instance reclamation.
+
+#### 4. Architecture: ARM64 Compatibility
+
+- Ampere A1 uses the **ARM64** ISA.
+- If building custom Docker images locally on an x86 machine (Intel/AMD), build and push multi-architecture images using Docker Buildx:
+  ```bash
+  docker buildx build --platform linux/amd64,linux/arm64 -t your-registry/url-shortener:latest --push .
+  ```
+
+#### 5. Billing Safety
+
+- Oracle Cloud allows up to:
+  - **4 OCPU cores and 24 GB RAM** across Ampere A1 instances.
+  - **200 GB Total Block Volume** (including boot volumes).
+  - **10 TB/month free outbound data transfer**.
+- Sticking to a **2 OCPU / 12 GB RAM** instance with a **50 GB boot volume** leaves plenty of headroom and guarantees $0 charges.
+
+---
+
+### Step 7: Official Links & Recommendation
+
+- [Oracle Cloud Free Tier — Sign up](https://www.oracle.com/cloud/free/?utm_source=chatgpt.com)
+- [Complete Always Free Resource List](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm?utm_source=chatgpt.com)
+- [OCI Cloud Console](https://cloud.oracle.com/?utm_source=chatgpt.com)
+
+> **Recommendation**: Provision the **2 OCPU / 12 GB Ampere VM** and use it as your personal Linux cloud server. It is an exceptional environment for learning real-world deployment, Docker, K3s, SSL, and DevOps workflows without paying recurring monthly VM fees.

@@ -65,34 +65,9 @@ A 7-character code using `[a-zA-Z0-9]` gives 62^7 ≈ 3.5 trillion combinations,
 
 ## High-Level Architecture
 
-```
-                        ┌──────────────┐
-                        │   Clients    │
-                        │ (Browser/App)│
-                        └──────┬───────┘
-                               │
-                        ┌──────▼───────┐
-                        │ Load Balancer│
-                        │  (GCP LB)    │
-                        └──────┬───────┘
-                               │
-                ┌──────────────▼──────────────┐
-                │       API Servers           │
-                │  (FastAPI on Cloud Run)      │
-                │                              │
-                │  POST /shorten → short code  │
-                │  GET /{code}  → 301 redirect │
-                └──────┬──────────────┬────────┘
-                       │              │
-                ┌──────▼──────┐ ┌─────▼──────┐
-                │    Redis    │ │ PostgreSQL  │
-                │   (Cache)   │ │  (Storage)  │
-                │ Cloud       │ │ Cloud SQL   │
-                │ Memorystore │ │             │
-                └─────────────┘ └─────────────┘
-```
+![Url Shortener High-Level Architecture](images/url-shortener.svg)
 
-The client sends a request to the load balancer, which forwards it to one of the FastAPI instances running on Cloud Run. For redirects, the API checks Redis first (cache hit returns in < 10 ms). On a cache miss, it queries PostgreSQL, caches the result, and redirects. For new URLs, the API generates a short code, stores it in PostgreSQL, and writes through to Redis.
+The client sends a request to the API Gateway, which forwards it to one of the FastAPI instances. For redirects, the API checks Redis first (cache hit returns in < 10 ms). On a cache miss, it queries PostgreSQL, caches the result, and redirects. For new URLs, the API generates a short code, stores it in PostgreSQL, and writes through to Redis.
 
 ---
 
@@ -2091,38 +2066,7 @@ tests/test_redirect.py   # UPDATED
 
 #### Table Schemas (Final)
 
-```
-┌──────────────────────────────────────┐
-│              urls                     │
-├──────────────────────────────────────┤
-│ id            BIGSERIAL  PRIMARY KEY  │
-│ short_code    VARCHAR(16) UNIQUE      │
-│ original_url  TEXT        NOT NULL    │
-│ created_at    TIMESTAMPTZ DEFAULT NOW │
-│ expires_at    TIMESTAMPTZ NULL        │
-│ click_count   BIGINT     DEFAULT 0    │
-│ is_active     BOOLEAN    DEFAULT TRUE │
-│ user_ip       VARCHAR(45)             │
-├──────────────────────────────────────┤
-│ INDEX idx_short_code (short_code)     │
-│ INDEX idx_expires_at (expires_at)     │
-└──────────────────────────────────────┘
-
-┌──────────────────────────────────────┐
-│            click_events               │
-├──────────────────────────────────────┤
-│ id            BIGSERIAL  PRIMARY KEY  │
-│ url_id        BIGINT     FK → urls.id │
-│ clicked_at    TIMESTAMPTZ DEFAULT NOW │
-│ referrer      TEXT                     │
-│ user_agent    TEXT                     │
-│ ip_address    VARCHAR(45)             │
-│ country       VARCHAR(2)              │
-├──────────────────────────────────────┤
-│ INDEX idx_url_id (url_id)             │
-│ INDEX idx_clicked_at (clicked_at)     │
-└──────────────────────────────────────┘
-```
+![Table Schemas](images/table_schemas.svg)
 
 The `click_events` table stores granular per-click data for analytics. Separating events from the URL record avoids locking the URL row on every redirect and lets you run analytics queries independently.
 
